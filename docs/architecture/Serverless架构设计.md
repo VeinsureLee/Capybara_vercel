@@ -15,8 +15,9 @@
 | 数据库 | Supabase PostgreSQL | 免费额度大，内置 Auth/Realtime/Storage |
 | 实时通信 | Supabase Realtime | WebSocket 订阅，免自建长连接 |
 | AI 对话 | Claude API / DeepSeek API | 多模型 fallback，按量付费 |
+| AI 记忆提取 | Claude API / DeepSeek API | 对话后异步提取结构化记忆（V2 新增） |
 | 图片生成 | AI 图片 API (可选) | 探索见闻插图生成 |
-| 定时任务 | Vercel Cron Jobs | 探索归来、串门触发等定时事件 |
+| 定时任务 | Vercel Cron Jobs | (V1, 保留) 探索归来、串门触发；(V2) 手记生成、旅行匹配、记忆提取 |
 | 推送通知 | Web Push API + Supabase Edge Functions | 途中见闻推送 |
 | 文件存储 | Supabase Storage | 用户头像、空间截图 |
 | 部署 | Vercel (hkg1 区域) | 香港节点，中国大陆访问友好 |
@@ -28,9 +29,9 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        用户设备 (PWA)                        │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
-│  │ 对话页面  │  │ 探索地图  │  │ 我的河岸  │  │ 社交发现  │   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐ │
+│  │ 对话页面  │  │ 旅行地图  │  │   手记    │  │卡皮的小本子│ │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬───────┘ │
 │       │              │              │              │         │
 │       └──────────────┼──────────────┼──────────────┘         │
 │                      │              │                        │
@@ -42,16 +43,18 @@
 │  ┌───────────────────┴──────────────┴──────────────────┐    │
 │  │              Next.js API Routes                      │    │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐│    │
-│  │  │/api/chat │ │/api/     │ │/api/space│ │/api/   ││    │
-│  │  │          │ │explore   │ │          │ │social  ││    │
+│  │  │/api/chat │ │/api/     │ │/api/     │ │/api/   ││    │
+│  │  │          │ │travel    │ │journal   │ │memory  ││    │
 │  │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └───┬────┘│    │
 │  └───────┼──────────── ┼───────────┼────────────┼─────┘    │
 │          │             │           │            │           │
 │  ┌───────┴─────────────┴───────────┴────────────┴─────┐    │
 │  │              Vercel Cron Jobs                       │    │
-│  │  • 每小时：处理探索归来事件                           │    │
-│  │  • 每2小时：触发卡皮巴拉串门                          │    │
-│  │  • 每日：重置每日探索次数                              │    │
+│  │  • (V1, 保留) 每小时：处理探索归来事件               │    │
+│  │  • (V2) 每晚：手记生成 (journal-generate)           │    │
+│  │  • (V2) 每日：旅行匹配 (travel-matching)            │    │
+│  │  • (V2) 每次对话后：记忆提取 (memory-extract)        │    │
+│  │  • 每日：重置每日次数                                 │    │
 │  └────────────────────────────────────────────────────┘    │
 └────────────────────────────────────────────────────────────┘
                        │
@@ -312,14 +315,165 @@ CREATE POLICY "users can view own messages"
   USING (sender_id = auth.uid() OR receiver_id = auth.uid());
 ```
 
+> 以上表结构为 V1 保留，以下为 V2 新增表。
+
+#### V2 新增表
+
+```sql
+-- ==========================================
+-- V2 记忆系统
+-- ==========================================
+
+-- 结构化记忆（从对话中 AI 提取）
+CREATE TABLE memories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  capybara_id UUID NOT NULL REFERENCES capybaras(id) ON DELETE CASCADE,
+  content TEXT NOT NULL,                -- 记忆内容摘要
+  topic TEXT NOT NULL,                  -- 话题分类（如"美食"、"旅行"、"音乐"）
+  emotion TEXT,                         -- 情感标签（happy, sad, nostalgic, excited...）
+  intent TEXT,                          -- 意图标签（share, seek_comfort, curiosity...）
+  source_conversation_id UUID REFERENCES conversations(id),
+  shareable BOOLEAN DEFAULT TRUE,       -- 是否可用于匹配（用户可控）
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  metadata JSONB DEFAULT '{}'::jsonb    -- 扩展字段
+);
+
+CREATE INDEX idx_memories_user ON memories(user_id, created_at DESC);
+CREATE INDEX idx_memories_topic ON memories USING GIN(to_tsvector('simple', topic));
+CREATE INDEX idx_memories_shareable ON memories(user_id, shareable) WHERE shareable = TRUE;
+
+-- ==========================================
+-- V2 旅行系统（替代 V1 探索系统）
+-- ==========================================
+
+-- 全球旅行目的地（MVP ~60 个，最终 350-600）
+CREATE TABLE travel_locations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,                   -- 地点名称（真实地名）
+  country TEXT NOT NULL,                -- 国家
+  region TEXT,                          -- 区域/省份
+  description TEXT,                     -- 一句话描述
+  theme TEXT NOT NULL,                  -- 自然/都市/文化/美食/冒险
+  coordinates JSONB,                    -- {lat, lng}
+  image_url TEXT,
+  rarity TEXT DEFAULT 'common',         -- common, uncommon, rare, legendary
+  available_days INT[] DEFAULT '{1,2,3,4,5}', -- 可选旅行天数
+  metadata JSONB DEFAULT '{}'::jsonb
+);
+
+-- 旅行记录（多日旅行，替代 explorations）
+CREATE TABLE travels (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  capybara_id UUID NOT NULL REFERENCES capybaras(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  location_id UUID REFERENCES travel_locations(id),
+  status TEXT NOT NULL DEFAULT 'traveling',  -- traveling, resting, completed, cancelled
+  duration_days INT NOT NULL DEFAULT 1,      -- 1-5 天
+  trigger_memories JSONB,                    -- 触发此次旅行的记忆 ID 列表
+  matched_user_id UUID REFERENCES profiles(id), -- 旅途中匹配到的用户
+  departure_at TIMESTAMPTZ DEFAULT NOW(),
+  estimated_return TIMESTAMPTZ,
+  rest_until TIMESTAMPTZ,                    -- 休息结束时间（归来后 1-2 天）
+  completed_at TIMESTAMPTZ,
+  metadata JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX idx_travels_user_status ON travels(user_id, status);
+CREATE INDEX idx_travels_capybara ON travels(capybara_id, status);
+
+-- ==========================================
+-- V2 手记系统（每晚生成）
+-- ==========================================
+
+-- 每日手记（Webtoon 风格叙事漫画）
+CREATE TABLE journals (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  travel_id UUID NOT NULL REFERENCES travels(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  day_number INT NOT NULL,               -- 旅行第几天
+  title TEXT,                            -- 手记标题
+  content JSONB NOT NULL,                -- 手记内容段落 [{type: "narrative"|"encounter"|"discovery", text, image_url?}]
+  encounter_capybara_id UUID REFERENCES capybaras(id), -- 偶遇的卡皮巴拉
+  encounter_summary TEXT,                -- 偶遇摘要
+  generated_at TIMESTAMPTZ DEFAULT NOW(),
+  read BOOLEAN DEFAULT FALSE,
+  metadata JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX idx_journals_user ON journals(user_id, generated_at DESC);
+CREATE INDEX idx_journals_travel ON journals(travel_id, day_number);
+
+-- ==========================================
+-- V2 装扮系统
+-- ==========================================
+
+-- 卡皮巴拉装扮物品
+CREATE TABLE costume_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  description TEXT,
+  category TEXT NOT NULL,                -- hat, accessory, outfit, background
+  rarity TEXT DEFAULT 'common',
+  image_url TEXT,
+  unlock_condition JSONB,                -- 解锁条件（旅行次数、特定地点等）
+  metadata JSONB DEFAULT '{}'::jsonb
+);
+
+-- 用户拥有的装扮
+CREATE TABLE user_costumes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  costume_item_id UUID NOT NULL REFERENCES costume_items(id),
+  equipped BOOLEAN DEFAULT FALSE,
+  obtained_at TIMESTAMPTZ DEFAULT NOW(),
+  obtained_from UUID REFERENCES travels(id) -- 从哪次旅行获得
+);
+
+CREATE INDEX idx_user_costumes_user ON user_costumes(user_id, equipped);
+
+-- ==========================================
+-- V2 RLS 策略
+-- ==========================================
+
+ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE travels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE journals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE costume_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_costumes ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "users can view own memories"
+  ON memories FOR SELECT USING (user_id = auth.uid());
+
+CREATE POLICY "users can update own memories"
+  ON memories FOR UPDATE USING (user_id = auth.uid());
+
+CREATE POLICY "users can view own travels"
+  ON travels FOR SELECT USING (user_id = auth.uid());
+
+CREATE POLICY "users can view own journals"
+  ON journals FOR SELECT USING (user_id = auth.uid());
+
+CREATE POLICY "anyone can view costume items"
+  ON costume_items FOR SELECT USING (true);
+
+CREATE POLICY "users can view own costumes"
+  ON user_costumes FOR SELECT USING (user_id = auth.uid());
+```
+
 ### 2.2 Supabase Realtime 订阅
 
 ```
-订阅频道设计：
+订阅频道设计（V1, 保留）：
 ├── exploration:{user_id}     → 探索状态变更、见闻推送
 ├── space:{space_id}          → 空间被访问通知、装饰变化
 ├── messages:{user_id}        → 新消息通知
 └── capybara:{capybara_id}    → 卡皮巴拉状态变更
+
+订阅频道设计（V2 新增）：
+├── travel:{user_id}          → 旅行状态变更（出发/匹配/归来/休息结束）
+├── journal:{user_id}         → 新手记生成通知（每晚推送）
+└── memory:{user_id}          → 新记忆提取通知、记忆可见性变更
 ```
 
 ---
@@ -328,21 +482,23 @@ CREATE POLICY "users can view own messages"
 
 ### 3.1 路由总览
 
+#### V1 路由 (保留)
+
 ```
 src/app/api/
 ├── auth/
 │   └── callback/route.ts          # Supabase Auth 回调
 ├── chat/
 │   └── route.ts                   # POST - 与卡皮巴拉对话
-├── explore/
+├── explore/                       # (V1, 保留)
 │   ├── route.ts                   # POST - 触发探索 / GET - 查询探索状态
 │   ├── complete/route.ts          # POST - 探索完成处理（Cron 调用）
 │   └── messages/route.ts          # GET - 获取途中见闻
-├── space/
+├── space/                         # (V1, 保留)
 │   ├── route.ts                   # GET - 获取自己的空间
 │   ├── [userId]/route.ts          # GET - 查看他人空间
 │   └── decorate/route.ts          # POST - 放置/移动物品
-├── social/
+├── social/                        # (V1, 保留)
 │   ├── visit/route.ts             # POST - 串门逻辑（Cron 调用）
 │   ├── discover/route.ts          # GET - 社交发现（推荐河岸）
 │   ├── greet/route.ts             # POST - 打招呼
@@ -350,10 +506,26 @@ src/app/api/
 ├── capybara/
 │   ├── route.ts                   # GET - 获取卡皮巴拉状态
 │   └── name/route.ts              # PUT - 修改名字
-└── cron/
+└── cron/                          # (V1, 保留)
     ├── exploration-check/route.ts  # 检查探索是否完成
     ├── capybara-visit/route.ts     # 触发卡皮巴拉串门
     └── daily-reset/route.ts        # 每日重置
+```
+
+#### V2 新增路由
+
+```
+src/app/api/
+├── travel/
+│   └── route.ts                   # POST - 发起旅行 / GET - 旅行状态
+├── journal/
+│   └── route.ts                   # GET - 获取手记列表 / POST - 手记互动（点赞/评论）
+├── memory/
+│   └── route.ts                   # GET - 记忆列表 / PATCH - 修改记忆可见性（shareable/private）
+└── cron/
+    ├── journal-generate/route.ts   # 每晚生成旅行手记（Webtoon 风格）
+    ├── travel-matching/route.ts    # 每日全局记忆匹配（0.6·topic + 0.25·emotion + 0.15·intent）
+    └── memory-extract/route.ts     # 对话后异步提取结构化记忆
 ```
 
 ### 3.2 核心 API 详细设计
@@ -435,6 +607,88 @@ src/app/api/
     owner_nickname: string
   }],
   can_greet: boolean       // 是否可以打招呼
+}
+```
+
+#### V2：旅行 API (`POST /api/travel`)
+
+```typescript
+// 请求
+{
+  location_id?: string,     // 可选：指定目的地（不指定则 AI 根据记忆推荐）
+  duration_days: number     // 旅行天数 1-5
+}
+
+// 响应
+{
+  travel_id: string,
+  location: { name, country, description, theme },
+  duration_days: number,
+  estimated_return: string,       // ISO 时间
+  rest_until: string,             // 休息结束时间（归来后 +1~2 天）
+  departure_message: string,      // 卡皮巴拉出发时说的话
+  matched_hint?: string           // 匹配提示（"旅途中可能会遇到志趣相投的朋友哦~"）
+}
+```
+
+**处理流程：**
+1. 验证卡皮巴拉状态为 `home`（非 traveling/resting）
+2. 聚合用户 shareable 记忆，AI 推荐目的地（或使用指定目的地）
+3. 创建旅行记录，状态 `traveling`
+4. 更新卡皮巴拉状态为 `traveling`
+5. 计算归来时间 + 休息结束时间
+6. 卡皮巴拉有 ~10% 概率拒绝出发（独立性表现），返回拒绝消息
+
+**V2 状态机：** `home → traveling (1-5天) → resting (1-2天) → home`
+
+#### V2：手记 API (`GET /api/journal`)
+
+```typescript
+// 响应
+{
+  journals: [{
+    id: string,
+    travel_id: string,
+    day_number: number,
+    title: string,
+    content: [                      // Webtoon 风格段落
+      { type: "narrative", text: string, image_url?: string },
+      { type: "encounter", text: string, capybara_name?: string },
+      { type: "discovery", text: string, image_url?: string }
+    ],
+    encounter_summary?: string,
+    generated_at: string,
+    read: boolean
+  }]
+}
+```
+
+#### V2：记忆 API (`GET /api/memory`)
+
+```typescript
+// 响应
+{
+  memories: [{
+    id: string,
+    content: string,
+    topic: string,
+    emotion: string,
+    intent: string,
+    shareable: boolean,
+    created_at: string
+  }],
+  stats: {
+    total: number,
+    shareable_count: number,
+    private_count: number,
+    top_topics: string[]
+  }
+}
+
+// PATCH /api/memory - 修改记忆可见性
+{
+  memory_id: string,
+  shareable: boolean        // true = 可用于匹配池, false = 私密
 }
 ```
 
@@ -532,6 +786,8 @@ const AI_PROVIDERS = [
 
 ### 5.1 vercel.json 配置
 
+#### V1 Cron (保留)
+
 ```json
 {
   "crons": [
@@ -555,14 +811,49 @@ const AI_PROVIDERS = [
 }
 ```
 
+#### V2 Cron 新增
+
+```json
+{
+  "crons": [
+    {
+      "path": "/api/cron/journal-generate",
+      "schedule": "0 21 * * *"
+    },
+    {
+      "path": "/api/cron/travel-matching",
+      "schedule": "0 6 * * *"
+    },
+    {
+      "path": "/api/cron/memory-extract",
+      "schedule": "*/10 * * * *"
+    },
+    {
+      "path": "/api/cron/daily-reset",
+      "schedule": "0 0 * * *"
+    }
+  ]
+}
+```
+
 ### 5.2 各 Cron Job 职责
+
+#### V1 Cron (保留)
 
 | Cron | 频率 | 职责 |
 |------|------|------|
-| exploration-check | 每30分钟 | 检查所有进行中的探索，到时间的标记完成，触发奖励计算 |
-| capybara-visit | 每2小时 | 为在家的卡皮巴拉安排串门，生成见闻 |
+| exploration-check | 每30分钟 | (V1, 保留) 检查所有进行中的探索，到时间的标记完成，触发奖励计算 |
+| capybara-visit | 每2小时 | (V1, 保留) 为在家的卡皮巴拉安排串门，生成见闻 |
 | daily-reset | 每天0点 | 重置每日探索次数、更新活跃度 |
-| send-exploration-messages | 每15分钟 | 发送到时间的途中见闻消息 |
+| send-exploration-messages | 每15分钟 | (V1, 保留) 发送到时间的途中见闻消息 |
+
+#### V2 Cron 新增
+
+| Cron | 频率 | 职责 |
+|------|------|------|
+| journal-generate | 每晚 21:00 | 为所有旅行中的卡皮巴拉生成当日手记（Webtoon 风格），包含偶遇段落 |
+| travel-matching | 每日 06:00 | 全局记忆匹配：计算 `0.6·topic_sim + 0.25·emotion_sim + 0.15·intent_sim`，为旅行中的卡皮巴拉分配偶遇对象 |
+| memory-extract | 每10分钟 | 检查最近未处理的对话，AI 提取结构化记忆（topic/emotion/intent），自动标记 shareable/private |
 
 ### 5.3 探索完成流程
 
@@ -802,23 +1093,36 @@ NEXT_PUBLIC_APP_URL=https://capybara.vercel.app
 
 ### 8.3 AI API 成本
 
+#### V1 AI 成本 (保留)
+
 | 场景 | 调用量/天 (1000 DAU) | 模型 | 成本/天 |
 |------|---------------------|------|---------|
 | 日常对话 | ~10,000 次 | DeepSeek-chat | ~$1 |
 | 探索生成 | ~2,000 次 | DeepSeek-chat | ~$0.5 |
 | 见闻消息 | ~4,000 次 | DeepSeek-chat | ~$0.3 |
 | 串门见闻 | ~1,000 次 | DeepSeek-chat | ~$0.1 |
-| **总计** | | | **~$2/天 ≈ $60/月** |
+| **V1 小计** | | | **~$2/天 ≈ $60/月** |
+
+#### V2 AI 成本新增
+
+| 场景 | 调用量/天 (1000 DAU) | 模型 | 成本/天 |
+|------|---------------------|------|---------|
+| 记忆提取 | ~10,000 次 | DeepSeek-chat | ~$0.8 |
+| 手记生成 | ~1,000 次（旅行中用户） | DeepSeek-chat | ~$1.5 |
+| 旅行匹配（记忆相似度计算） | ~500 次 | DeepSeek-chat | ~$0.3 |
+| 旅行目的地推荐 | ~800 次 | DeepSeek-chat | ~$0.2 |
+| **V2 新增小计** | | | **~$2.8/天 ≈ $84/月** |
+| **V1 + V2 总计** | | | **~$4.8/天 ≈ $144/月** |
 
 ### 8.4 MVP 总成本
 
-| 项目 | 月费用 |
-|------|--------|
-| Vercel Pro | $20 |
-| Supabase Free | $0 |
-| AI API | ~$60 |
-| 域名 | ~$1 |
-| **总计** | **~$81/月** |
+| 项目 | V1 月费用 | V2 月费用（含 V1） |
+|------|--------|--------|
+| Vercel Pro | $20 | $20 |
+| Supabase Free | $0 | $0 |
+| AI API | ~$60 | ~$144 |
+| 域名 | ~$1 | ~$1 |
+| **总计** | **~$81/月** | **~$165/月** |
 
 ---
 
@@ -879,3 +1183,52 @@ NEXT_PUBLIC_APP_URL=https://capybara.vercel.app
 - [ ] 性能优化
 - [ ] 冷启动内容（系统生成的无主河岸）
 - [ ] 部署上线
+
+---
+
+### V2 新增开发阶段
+
+### Phase V2-1：记忆系统 (1-2 周)
+
+- [ ] memories 表创建 + RLS
+- [ ] 记忆提取 AI Prompt 设计与实现 (`src/lib/ai/memory.ts`)
+- [ ] `POST /api/memory` — 记忆提取触发
+- [ ] `GET /api/memory` — 记忆列表 + 统计
+- [ ] `PATCH /api/memory` — 修改记忆可见性 (shareable/private)
+- [ ] Cron: memory-extract 定时任务
+- [ ] 前端：卡皮的小本子（记忆库页面）
+
+### Phase V2-2：多日旅行系统 (2 周)
+
+- [ ] travel_locations + travels 表创建 + RLS
+- [ ] MVP 目的地数据导入（~60 个真实地点）
+- [ ] `POST /api/travel` — 发起旅行（含 ~10% 拒绝率）
+- [ ] `GET /api/travel` — 旅行状态查询
+- [ ] V2 状态机实现：`home → traveling (1-5天) → resting (1-2天) → home`
+- [ ] 旅行目的地 AI 推荐（基于记忆）
+- [ ] 前端：旅行地图页面
+
+### Phase V2-3：手记系统 (1-2 周)
+
+- [ ] journals 表创建 + RLS
+- [ ] 手记生成 AI Prompt（Webtoon 风格叙事段落 + 偶遇段落）
+- [ ] Cron: journal-generate 每晚生成
+- [ ] `GET /api/journal` — 手记列表
+- [ ] `POST /api/journal` — 手记互动
+- [ ] 前端：手记浏览页面（Webtoon 竖向滚动）
+
+### Phase V2-4：记忆驱动匹配 (1-2 周)
+
+- [ ] 记忆匹配算法实现 (`src/lib/sim/memory-match.ts`)
+- [ ] 匹配公式：`0.6·topic_sim + 0.25·emotion_sim + 0.15·intent_sim`
+- [ ] Cron: travel-matching 每日全局匹配
+- [ ] 手记中偶遇段落生成
+- [ ] 装扮系统（costume_items + user_costumes）
+
+### Phase V2-5：打磨与切换 (1 周)
+
+- [ ] V1 → V2 数据迁移脚本
+- [ ] 卡皮巴拉独立性行为（休息日生活层动作）
+- [ ] 隐私设置 UI（记忆可见性批量管理）
+- [ ] V2 Realtime 频道切换
+- [ ] 全链路测试 + 上线

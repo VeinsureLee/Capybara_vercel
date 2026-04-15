@@ -6,7 +6,9 @@ import { usePathname } from 'next/navigation'
 const tabs = [
   { href: '/home', icon: '🏠', label: '河岸' },
   { href: '/chat', icon: '💬', label: '聊天' },
-  { href: '/explore', icon: '🗺️', label: '探索' },
+  { href: '/travel', icon: '🗺️', label: '旅行' },
+  { href: '/journal', icon: '📖', label: '手记' },
+  { href: '/memory', icon: '📝', label: '记忆' },
 ]
 
 export default function BottomNav() {

@@ -24,7 +24,10 @@ export default function ChatPage() {
   const [sending, setSending] = useState(false)
   const [setupName, setSetupName] = useState('')
   const [showExplorePrompt, setShowExplorePrompt] = useState(false)
+  const [showTravelPrompt, setShowTravelPrompt] = useState(false)
   const [explorationInfo, setExplorationInfo] = useState<string | null>(null)
+  const [travelInfo, setTravelInfo] = useState<string | null>(null)
+  const [memoryReaction, setMemoryReaction] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const supabase = createClient()
 
@@ -40,6 +43,7 @@ export default function ChatPage() {
       setCapybara(data.capybara)
       await loadMessages()
       await checkExploration()
+      await checkTravel()
       setView('chat')
     } else {
       setView('setup')
@@ -87,6 +91,24 @@ export default function ChatPage() {
     }
   }
 
+  async function checkTravel() {
+    const res = await fetch('/api/travel')
+    const data = await res.json()
+    if (data.travel) {
+      if (data.just_completed) {
+        setTravelInfo(`🎉 卡皮旅行回来了！正在家里休息~`)
+        const capRes = await fetch('/api/capybara')
+        const capData = await capRes.json()
+        if (capData.capybara) setCapybara(capData.capybara)
+      } else if (data.travel.status === 'traveling') {
+        const loc = data.travel.travel_locations?.name ?? '远方'
+        const returnTime = new Date(data.travel.estimated_return)
+        const remaining = Math.max(0, Math.ceil((returnTime.getTime() - Date.now()) / 60000))
+        setTravelInfo(`🗺️ 卡皮正在${loc}旅行... 约 ${remaining} 分钟后回来`)
+      }
+    }
+  }
+
   // 滚到底部
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -95,7 +117,14 @@ export default function ChatPage() {
   // 定期检查探索状态
   useEffect(() => {
     if (capybara?.status !== 'exploring') return
-    const interval = setInterval(checkExploration, 15000) // 15秒检查一次
+    const interval = setInterval(checkExploration, 15000)
+    return () => clearInterval(interval)
+  }, [capybara?.status])
+
+  // 定期检查旅行状态
+  useEffect(() => {
+    if (capybara?.status !== 'traveling') return
+    const interval = setInterval(checkTravel, 30000)
     return () => clearInterval(interval)
   }, [capybara?.status])
 
@@ -157,9 +186,20 @@ export default function ChatPage() {
         setCapybara({ ...capybara, mood: data.mood })
       }
 
-      // 探索提示
+      // 探索提示（V1）
       if (data.want_to_explore) {
         setShowExplorePrompt(true)
+      }
+
+      // 旅行提示（V2）
+      if (data.want_to_travel) {
+        setShowTravelPrompt(true)
+      }
+
+      // 记忆反应（V2）
+      if (data.memory_reaction) {
+        setMemoryReaction(data.memory_reaction)
+        setTimeout(() => setMemoryReaction(null), 5000)
       }
     } catch (err) {
       console.error('Send error:', err)
@@ -204,6 +244,51 @@ export default function ChatPage() {
       }
     } catch (err) {
       console.error('Explore error:', err)
+    }
+  }
+
+  // 发起旅行（V2）
+  async function startTravel() {
+    setShowTravelPrompt(false)
+    try {
+      const res = await fetch('/api/travel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const data = await res.json()
+
+      if (data.refused) {
+        const sysMsg: Conversation = {
+          id: uid(),
+          user_id: '',
+          capybara_id: '',
+          role: 'capybara',
+          content: data.message,
+          created_at: new Date().toISOString(),
+        }
+        setMessages((prev) => [...prev, sysMsg])
+      } else if (data.departure_message) {
+        const sysMsg: Conversation = {
+          id: uid(),
+          user_id: '',
+          capybara_id: '',
+          role: 'capybara',
+          content: `🗺️ ${data.departure_message}`,
+          created_at: new Date().toISOString(),
+        }
+        setMessages((prev) => [...prev, sysMsg])
+
+        if (capybara) {
+          setCapybara({ ...capybara, status: 'traveling' })
+        }
+
+        const returnTime = new Date(data.estimated_return)
+        const remaining = Math.ceil((returnTime.getTime() - Date.now()) / 60000)
+        setTravelInfo(`🗺️ 卡皮出发了！去${data.location.name}，约 ${remaining} 分钟后回来`)
+      }
+    } catch (err) {
+      console.error('Travel error:', err)
     }
   }
 
@@ -269,9 +354,12 @@ export default function ChatPage() {
             {capybara?.name || '卡皮'}
           </div>
           <div className="text-[11px] text-gray-400">
-            {capybara?.status === 'exploring'
-              ? '探索中...'
-              : moodLabel[capybara?.mood || 'calm'] || '平静'}
+            {capybara?.status === 'exploring' && '探索中...'}
+            {capybara?.status === 'traveling' && '旅行中 🗺️'}
+            {capybara?.status === 'resting' && '休息中 💤'}
+            {capybara?.status === 'visiting' && '串门中...'}
+            {(capybara?.status === 'home' || !capybara?.status) &&
+              (moodLabel[capybara?.mood || 'calm'] || '平静')}
           </div>
         </div>
         <div className="text-xs text-gray-300">
@@ -286,6 +374,23 @@ export default function ChatPage() {
           onClick={checkExploration}
         >
           {explorationInfo}
+        </div>
+      )}
+
+      {/* 旅行状态横幅 */}
+      {travelInfo && (
+        <div
+          className="mx-3 mt-2 px-3 py-2 bg-meadow-50 border border-meadow-200 rounded-lg text-xs text-meadow-700 cursor-pointer"
+          onClick={checkTravel}
+        >
+          {travelInfo}
+        </div>
+      )}
+
+      {/* 记忆反应提示 */}
+      {memoryReaction && (
+        <div className="mx-3 mt-2 px-3 py-2 bg-capybara-50 border border-capybara-200 rounded-lg text-xs text-capybara-700 animate-fade-in">
+          📝 {memoryReaction}
         </div>
       )}
 
@@ -364,6 +469,31 @@ export default function ChatPage() {
               onClick={() => setShowExplorePrompt(false)}
               className="flex-1 py-2 bg-white text-amber-600 rounded-lg text-sm
                          border border-amber-300 hover:bg-amber-50 transition"
+            >
+              再聊聊
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* V2 旅行提示卡片 */}
+      {showTravelPrompt && capybara?.status === 'home' && (
+        <div className="mx-3 mb-2 p-3 bg-meadow-50 rounded-xl border border-meadow-200">
+          <p className="text-sm text-meadow-800 mb-2">
+            🗺️ {capybara.name}想出去旅行，去看看外面的世界~
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={startTravel}
+              className="flex-1 py-2 bg-meadow-500 text-white rounded-lg text-sm
+                         hover:bg-meadow-600 transition font-medium"
+            >
+              让它去吧
+            </button>
+            <button
+              onClick={() => setShowTravelPrompt(false)}
+              className="flex-1 py-2 bg-white text-meadow-600 rounded-lg text-sm
+                         border border-meadow-300 hover:bg-meadow-50 transition"
             >
               再聊聊
             </button>

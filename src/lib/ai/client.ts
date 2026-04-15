@@ -259,7 +259,8 @@ export function fallbackExploration(keywords: string[]) {
   const loc = locations[Math.floor(Math.random() * locations.length)]
   const types: ('short' | 'medium' | 'long')[] = ['short', 'short', 'medium', 'medium', 'long']
   const type = types[Math.floor(Math.random() * types.length)]
-  const durationHours = type === 'short' ? 0.05 : type === 'medium' ? 0.1 : 0.2 // MVP 用短时间方便测试
+  // 测试模式：short=3分钟, medium=6分钟, long=12分钟
+  const durationHours = type === 'short' ? 0.05 : type === 'medium' ? 0.1 : 0.2
 
   return {
     location: loc,
