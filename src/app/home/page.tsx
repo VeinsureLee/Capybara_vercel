@@ -4,11 +4,13 @@ import { useState, useEffect } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 import BottomNav from '@/components/BottomNav'
-import type { Capybara, Exploration, ExplorationItem } from '@/types'
+import type { Capybara, Exploration, ExplorationItem, Travel, Journal } from '@/types'
 
 export default function HomePage() {
   const [capybara, setCapybara] = useState<Capybara | null>(null)
   const [recentExplorations, setRecentExplorations] = useState<Exploration[]>([])
+  const [recentTravels, setRecentTravels] = useState<(Travel & { location_name?: string })[]>([])
+  const [travelJournals, setTravelJournals] = useState<Journal[]>([])
   const [loading, setLoading] = useState(true)
   const [showMenu, setShowMenu] = useState(false)
   const [loggingOut, setLoggingOut] = useState(false)
@@ -53,15 +55,48 @@ export default function HomePage() {
 
         setRecentExplorations(data || [])
       }
+
+      // V2: 获取最近完成的旅行记录及物品
+      if (user) {
+        const { data: travels } = await supabase
+          .from('travels')
+          .select('*, travel_locations(name, region)')
+          .eq('user_id', user.id)
+          .eq('status', 'completed')
+          .order('completed_at', { ascending: false })
+          .limit(10)
+
+        const travelsWithName = (travels || []).map((t: Record<string, unknown>) => {
+          const loc = t.travel_locations as { name: string; region: string } | null
+          return { ...t, location_name: loc?.name ?? '未知地点' }
+        })
+        setRecentTravels(travelsWithName as (Travel & { location_name?: string })[])
+
+        // 获取这些旅行的手记
+        const travelIds = (travels || []).map((t: Record<string, unknown>) => t.id as string)
+        if (travelIds.length > 0) {
+          const { data: journals } = await supabase
+            .from('journals')
+            .select('*')
+            .in('travel_id', travelIds)
+            .order('created_at', { ascending: false })
+
+          setTravelJournals((journals || []) as Journal[])
+        }
+      }
     }
 
     setLoading(false)
   }
 
-  // 收集所有探索获得的物品
-  const allItems: ExplorationItem[] = recentExplorations.flatMap(
+  // 收集所有物品（V1 探索 + V2 旅行）
+  const v1Items: ExplorationItem[] = recentExplorations.flatMap(
     (exp) => (exp.items_found || []) as ExplorationItem[]
   )
+  const v2Items: ExplorationItem[] = recentTravels.flatMap(
+    (t) => (t.items_found || []) as ExplorationItem[]
+  )
+  const allItems: ExplorationItem[] = [...v2Items, ...v1Items]
 
   const rarityColor: Record<string, string> = {
     common: 'bg-gray-100 text-gray-600',
@@ -204,45 +239,39 @@ export default function HomePage() {
           )}
         </section>
 
-        {/* 探索日志 */}
-        <section>
-          <button
-            onClick={() => setLogsSectionOpen(!logsSectionOpen)}
-            className="flex items-center justify-between w-full mb-2"
-          >
-            <h3 className="text-sm font-semibold text-gray-600">
-              📖 探索日志 ({recentExplorations.length})
-            </h3>
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              className={`w-4 h-4 text-gray-400 transition-transform duration-200 ${logsSectionOpen ? 'rotate-180' : ''}`}
-              fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+        {/* 旅途手记（V2） */}
+        {travelJournals.length > 0 && (
+          <section>
+            <button
+              onClick={() => setLogsSectionOpen(!logsSectionOpen)}
+              className="flex items-center justify-between w-full mb-2"
             >
-              <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-          {logsSectionOpen && (
-            recentExplorations.length === 0 ? (
-              <div className="text-center py-6 text-gray-300 text-sm">
-                暂无探索记录
-              </div>
-            ) : (
+              <h3 className="text-sm font-semibold text-gray-600">
+                📖 旅途手记 ({travelJournals.length})
+              </h3>
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                className={`w-4 h-4 text-gray-400 transition-transform duration-200 ${logsSectionOpen ? 'rotate-180' : ''}`}
+                fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+            {logsSectionOpen && (
               <div className="space-y-2">
-                {recentExplorations.map((exp, i) => (
+                {travelJournals.map((journal, i) => (
                   <button
-                    key={exp.id}
+                    key={journal.id}
                     onClick={() => setExpandedLogIndex(expandedLogIndex === i ? null : i)}
                     className="w-full text-left p-3 bg-white rounded-xl shadow-sm border border-gray-50 transition-all duration-200"
                   >
                     <div className="flex items-center justify-between">
                       <p className="text-sm text-gray-700 truncate flex-1 mr-2">
-                        {exp.story ? exp.story.slice(0, 30) + (exp.story.length > 30 ? '...' : '') : '探索记录'}
+                        {journal.location_name} · 第{journal.day_number}天
                       </p>
                       <div className="flex items-center gap-1.5 shrink-0">
                         <span className="text-[10px] text-gray-300">
-                          {exp.completed_at
-                            ? new Date(exp.completed_at).toLocaleDateString('zh-CN')
-                            : ''}
+                          {new Date(journal.created_at).toLocaleDateString('zh-CN')}
                         </span>
                         <svg
                           xmlns="http://www.w3.org/2000/svg"
@@ -256,21 +285,103 @@ export default function HomePage() {
                     {expandedLogIndex === i && (
                       <div className="mt-2 pt-2 border-t border-gray-50">
                         <p className="text-sm text-gray-700 leading-relaxed">
-                          {exp.story}
+                          {journal.narrative}
                         </p>
-                        <p className="text-[10px] text-gray-300 mt-2">
-                          {exp.completed_at
-                            ? new Date(exp.completed_at).toLocaleString('zh-CN')
-                            : ''}
-                        </p>
+                        {journal.daily_item && (
+                          <div className="mt-2 flex items-center gap-1.5">
+                            <span className="text-xs text-capybara-600">📌 {journal.daily_item.name}</span>
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${rarityColor[journal.daily_item.rarity] || rarityColor.common}`}>
+                              {rarityLabel[journal.daily_item.rarity] || '普通'}
+                            </span>
+                          </div>
+                        )}
                       </div>
                     )}
                   </button>
                 ))}
               </div>
-            )
-          )}
-        </section>
+            )}
+          </section>
+        )}
+
+        {/* 探索日志（V1） */}
+        {recentExplorations.length > 0 && (
+          <section>
+            <button
+              onClick={() => setLogsSectionOpen(!logsSectionOpen)}
+              className="flex items-center justify-between w-full mb-2"
+            >
+              <h3 className="text-sm font-semibold text-gray-600">
+                📖 探索日志 ({recentExplorations.length})
+              </h3>
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                className={`w-4 h-4 text-gray-400 transition-transform duration-200 ${logsSectionOpen ? 'rotate-180' : ''}`}
+                fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+            {logsSectionOpen && (
+              <div className="space-y-2">
+                {recentExplorations.map((exp, i) => {
+                  const logIndex = travelJournals.length + i
+                  return (
+                    <button
+                      key={exp.id}
+                      onClick={() => setExpandedLogIndex(expandedLogIndex === logIndex ? null : logIndex)}
+                      className="w-full text-left p-3 bg-white rounded-xl shadow-sm border border-gray-50 transition-all duration-200"
+                    >
+                      <div className="flex items-center justify-between">
+                        <p className="text-sm text-gray-700 truncate flex-1 mr-2">
+                          {exp.story ? exp.story.slice(0, 30) + (exp.story.length > 30 ? '...' : '') : '探索记录'}
+                        </p>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="text-[10px] text-gray-300">
+                            {exp.completed_at
+                              ? new Date(exp.completed_at).toLocaleDateString('zh-CN')
+                              : ''}
+                          </span>
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            className={`w-3 h-3 text-gray-300 transition-transform duration-200 ${expandedLogIndex === logIndex ? 'rotate-180' : ''}`}
+                            fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                          </svg>
+                        </div>
+                      </div>
+                      {expandedLogIndex === logIndex && (
+                        <div className="mt-2 pt-2 border-t border-gray-50">
+                          <p className="text-sm text-gray-700 leading-relaxed">
+                            {exp.story}
+                          </p>
+                          <p className="text-[10px] text-gray-300 mt-2">
+                            {exp.completed_at
+                              ? new Date(exp.completed_at).toLocaleString('zh-CN')
+                              : ''}
+                          </p>
+                        </div>
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* 无任何记录时的空状态 */}
+        {travelJournals.length === 0 && recentExplorations.length === 0 && (
+          <section>
+            <h3 className="text-sm font-semibold text-gray-600 mb-2">
+              📖 旅途手记
+            </h3>
+            <div className="text-center py-6 text-gray-300 text-sm">
+              还没有旅途记录，让{capybara?.name || '卡皮'}去旅行吧~
+            </div>
+          </section>
+        )}
 
         {/* 卡皮巴拉信息卡 */}
         <section>

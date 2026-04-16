@@ -3,6 +3,7 @@ import { createServerSupabase } from '@/lib/supabase/server'
 import { callAI } from '@/lib/ai/client'
 import { journalPrompt } from '@/lib/ai/prompts'
 import { MS_PER_DAY } from '@/lib/travel/timeConfig'
+import { findLocationContent } from '@/lib/travel/locationContent'
 
 /**
  * GET /api/journal - 获取某次旅行的手记列表
@@ -190,18 +191,49 @@ export async function POST(req: NextRequest) {
     } catch { /* fallback */ }
   }
 
-  // 8. 保存手记
+  // 8. 查找地点探索图片和文学引用
+  const locName = location?.name ?? '未知地点'
+  const locRegion = (location as { region?: string } | null)?.region ?? ''
+
+  // 先尝试从 DB 查找，找不到则用本地数据
+  let contentImageUrl: string | null = null
+  let contentQuote: string | null = null
+  let contentQuoteSource: string | null = null
+
+  const { data: dbContent } = await supabase
+    .from('location_content')
+    .select('image_url, image_caption, quote, quote_source')
+    .or(`location_name.eq.${locName},region_keyword.ilike.%${locRegion.split('·')[0]}%`)
+    .limit(5)
+
+  if (dbContent && dbContent.length > 0) {
+    const pick = dbContent[Math.floor(Math.random() * dbContent.length)]
+    contentImageUrl = pick.image_url
+    contentQuote = pick.quote
+    contentQuoteSource = pick.quote_source
+  } else {
+    // fallback 到本地种子数据
+    const localContent = findLocationContent(locName, locRegion)
+    contentImageUrl = localContent.image_url
+    contentQuote = localContent.quote
+    contentQuoteSource = localContent.quote_source
+  }
+
+  // 9. 保存手记
   const baseRow = {
     travel_id: travel.id,
     user_id: user.id,
     day_number: dayNumber,
-    location_name: location?.name ?? '未知地点',
+    location_name: locName,
     narrative,
     encounter_narrative: encounterNarrative,
     encounter_user_id: hasEncounter ? travel.matched_user_id : null,
     encounter_score: encounterScore > 0 ? encounterScore : null,
     daily_item: dailyItem,
     segment_id: currentSegment?.id ?? null,
+    image_url: contentImageUrl,
+    literary_quote: contentQuote,
+    quote_source: contentQuoteSource,
   }
 
   const rowWithHighlights = visualHighlights
@@ -237,7 +269,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  // 9. 物品追加
+  // 10. 物品追加
   if (dailyItem) {
     const currentItems = (travel.items_found as unknown[]) ?? []
     await supabase

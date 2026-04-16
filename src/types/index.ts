@@ -249,6 +249,12 @@ export interface Journal {
   daily_item?: ExplorationItem | null
   /** V2.1: 图片标注数据（AI 生成的关键词+位置） */
   visual_highlights?: VisualHighlight[] | null
+  /** V2.2: 探索图片 URL（来自 location_content） */
+  image_url?: string | null
+  /** V2.2: 文学/艺术引用 */
+  literary_quote?: string | null
+  /** V2.2: 引用来源 */
+  quote_source?: string | null
   created_at: string
 }
 

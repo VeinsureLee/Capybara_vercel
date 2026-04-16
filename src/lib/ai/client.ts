@@ -121,21 +121,21 @@ export function fallbackChat(userMessage: string): ChatResponse {
   }[] = [
     {
       pattern: /累|疲|困|辛苦|加班/,
-      reply: '呀...主人辛苦了。要不我去找点能让你放松的东西？',
+      reply: '呀...辛苦了。要不我出去找点能让你放松的东西？',
       mood: 'calm',
       keywords: ['休息', '放松'],
       explore: true,
     },
     {
       pattern: /开心|高兴|快乐|太好了|哈哈/,
-      reply: '嘿嘿，看到主人开心我也好开心呀~ 今天真是好日子！',
+      reply: '嘿嘿，你开心我也开心~ 今天真是好日子！',
       mood: 'happy',
       keywords: ['快乐', '阳光'],
       explore: false,
     },
     {
       pattern: /难过|伤心|不好|烦|郁闷/,
-      reply: '主人别难过...我陪着你呢。要不我出去找点好玩的给你看？',
+      reply: '别难过...我陪着你呢。要不我出去找点好玩的给你看？',
       mood: 'calm',
       keywords: ['安慰', '温暖'],
       explore: true,
@@ -156,7 +156,7 @@ export function fallbackChat(userMessage: string): ChatResponse {
     },
     {
       pattern: /花|草|植物|自然|树/,
-      reply: '主人也喜欢植物呀！我上次看到一朵好漂亮的花~',
+      reply: '你也喜欢植物呀！我上次看到一朵好漂亮的花~',
       mood: 'happy',
       keywords: ['自然', '植物'],
       explore: false,
@@ -170,7 +170,7 @@ export function fallbackChat(userMessage: string): ChatResponse {
     },
     {
       pattern: /你好|嗨|早|晚安|hello/i,
-      reply: '嘿嘿~主人好呀！今天想聊点什么？',
+      reply: '嘿嘿~你好呀！',
       mood: 'happy',
       keywords: ['问候'],
       explore: false,
@@ -200,7 +200,7 @@ export function fallbackChat(userMessage: string): ChatResponse {
     { reply: '嘿嘿~我在认真听呢！', mood: 'happy' },
     { reply: '呀，真的吗？好有意思~', mood: 'curious' },
     { reply: '嗯嗯，然后呢然后呢？', mood: 'curious' },
-    { reply: '主人说得对呀~让我想想...', mood: 'calm' },
+    { reply: '嗯...让我想想...', mood: 'calm' },
     { reply: '哦哦！我懂了！嘿嘿~', mood: 'happy' },
   ]
   const d = defaults[Math.floor(Math.random() * defaults.length)]

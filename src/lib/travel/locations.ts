@@ -123,6 +123,14 @@ export function selectLocation(
     return available[Math.floor(Math.random() * available.length)]
   }
 
+  // 优先：意向词直接匹配地名/区域（用户说"北京"就去北京）
+  for (const intent of intents) {
+    const nameMatch = available.find(
+      (loc) => loc.name.includes(intent) || loc.region.includes(intent)
+    )
+    if (nameMatch) return nameMatch
+  }
+
   // 收集所有匹配的标签
   const targetTags = new Set<string>()
   for (const intent of intents) {

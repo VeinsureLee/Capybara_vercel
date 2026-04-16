@@ -97,7 +97,7 @@ export async function POST(req: NextRequest) {
             reply: parsed.reply,
             mood: parsed.mood,
             keywords: parsed.keywords ?? [],
-            want_to_explore: parsed.want_to_travel ?? false,
+            want_to_explore: false,
           }
           v2Response = {
             reply: parsed.reply,
@@ -171,23 +171,21 @@ export async function POST(req: NextRequest) {
     console.error('[Memory] extraction failed:', err)
   }
 
-  // 5. 保存对话
-  await supabase.from('conversations').insert([
-    {
-      user_id: user.id,
-      capybara_id: capybara.id,
-      role: 'user',
-      content: message,
-      keywords: chatResponse.keywords,
-    },
-    {
-      user_id: user.id,
-      capybara_id: capybara.id,
-      role: 'capybara',
-      content: chatResponse.reply,
-      mood: chatResponse.mood,
-    },
-  ])
+  // 5. 保存对话（分两次插入，确保 created_at 不同，避免排序错乱）
+  await supabase.from('conversations').insert({
+    user_id: user.id,
+    capybara_id: capybara.id,
+    role: 'user',
+    content: message,
+    keywords: chatResponse.keywords,
+  })
+  await supabase.from('conversations').insert({
+    user_id: user.id,
+    capybara_id: capybara.id,
+    role: 'capybara',
+    content: chatResponse.reply,
+    mood: chatResponse.mood,
+  })
 
   // 6. 更新卡皮巴拉心情
   await supabase

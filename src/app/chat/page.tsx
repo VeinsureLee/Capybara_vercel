@@ -24,7 +24,7 @@ export default function ChatPage() {
   const [sending, setSending] = useState(false)
   const [setupName, setSetupName] = useState('')
   const [showExplorePrompt, setShowExplorePrompt] = useState(false)
-  const [showTravelPrompt, setShowTravelPrompt] = useState(false)
+  // showTravelPrompt removed — travel auto-starts from chat keywords
   const [explorationInfo, setExplorationInfo] = useState<string | null>(null)
   const [travelInfo, setTravelInfo] = useState<string | null>(null)
   const [memoryReaction, setMemoryReaction] = useState<string | null>(null)
@@ -191,9 +191,9 @@ export default function ChatPage() {
         setShowExplorePrompt(true)
       }
 
-      // 旅行提示（V2）
-      if (data.want_to_travel) {
-        setShowTravelPrompt(true)
+      // 旅行（V2）：直接出发，不需要确认
+      if (data.want_to_travel && capybara?.status === 'home') {
+        startTravelWithKeywords(data.keywords ?? [])
       }
 
       // 记忆反应（V2）
@@ -247,14 +247,13 @@ export default function ChatPage() {
     }
   }
 
-  // 发起旅行（V2）
-  async function startTravel() {
-    setShowTravelPrompt(false)
+  // 发起旅行（V2）—— 直接出发，传入对话关键词帮助选地点
+  async function startTravelWithKeywords(keywords: string[]) {
     try {
       const res = await fetch('/api/travel', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ chat_keywords: keywords }),
       })
       const data = await res.json()
 
@@ -476,30 +475,7 @@ export default function ChatPage() {
         </div>
       )}
 
-      {/* V2 旅行提示卡片 */}
-      {showTravelPrompt && capybara?.status === 'home' && (
-        <div className="mx-3 mb-2 p-3 bg-meadow-50 rounded-xl border border-meadow-200">
-          <p className="text-sm text-meadow-800 mb-2">
-            🗺️ {capybara.name}想出去旅行，去看看外面的世界~
-          </p>
-          <div className="flex gap-2">
-            <button
-              onClick={startTravel}
-              className="flex-1 py-2 bg-meadow-500 text-white rounded-lg text-sm
-                         hover:bg-meadow-600 transition font-medium"
-            >
-              让它去吧
-            </button>
-            <button
-              onClick={() => setShowTravelPrompt(false)}
-              className="flex-1 py-2 bg-white text-meadow-600 rounded-lg text-sm
-                         border border-meadow-300 hover:bg-meadow-50 transition"
-            >
-              再聊聊
-            </button>
-          </div>
-        </div>
-      )}
+      {/* V2 旅行提示卡片已移除 — 旅行通过聊天自动触发 */}
 
       {/* 输入框 */}
       <form onSubmit={sendMessage} className="px-3 py-2 bg-white/90 backdrop-blur border-t border-gray-100">

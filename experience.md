@@ -65,6 +65,40 @@ Lessons learned from debugging. Read this before writing new code to avoid repea
 
 ---
 
+## Database Ordering
+
+### [BUG-009] 需要保序的记录不要批量插入
+- **Context**: 用户消息和卡皮消息通过 `insert([user_msg, capy_msg])` 批量写入，两条记录获得相同 `created_at`（`default now()`），查询时 `order by created_at asc` 排序不确定，导致卡皮消息偶尔出现在用户消息之前。
+- **Principle**: 需要保持顺序的记录必须分次插入，确保时间戳不同。不要依赖同一事务内 `default now()` 的隐含顺序。
+- **Files**: `src/app/api/chat/route.ts`
+
+---
+
+## AI Prompt Engineering
+
+### [BUG-010] AI Prompt 应模块化，关键规则置顶
+- **Context**: 单一长 prompt 把语言能力规则埋在人设描述后面，DeepSeek 模型忽略了"不要说听不懂"的规则，每条回复都说"唔...听不懂"。
+- **Principle**: 1) 将 prompt 拆分为独立模块（语言能力/身份/风格/状态/输出格式），用标记分隔。2) 最重要的规则放最前面（语言能力 > 身份 > 风格）。3) 添加 few-shot 示例比纯规则描述更有效——模型看到示例后更容易理解期望的输出模式。
+- **Files**: `src/lib/ai/prompts.ts`
+
+---
+
+## Feature Design
+
+### [BUG-011] V2 功能不应复用 V1 字段
+- **Context**: V2 的 `want_to_travel` 被同时赋给了 V1 的 `want_to_explore`，导致前端弹出两个互斥的确认卡片（"探索"和"旅行"）。
+- **Principle**: 新版本功能应使用独立字段，不要复用旧字段做双重映射。一个用户意图应只触发一个行为路径。
+- **Files**: `src/app/api/chat/route.ts`, `src/app/chat/page.tsx`
+
+---
+
+### [BUG-012] 地点选择必须先匹配地名再匹配标签
+- **Context**: 用户说"北京"，`selectLocation()` 只按 tags（胡同、怀旧、安静）匹配，"北京"不在任何 tag 里，于是随机选了日本的地点。同时 `startTravel()` 没有传对话关键词，API 从历史意图中选择，"北京"优先级不够。
+- **Principle**: 1) 地点选择应先尝试地名/区域精确匹配，再 fallback 到标签匹配。2) 当前对话的关键词优先级应高于历史聚合意图，需要显式传递到 API。
+- **Files**: `src/lib/travel/locations.ts`, `src/app/chat/page.tsx`, `src/app/api/travel/route.ts`
+
+---
+
 ## Time / Timezone
 
 ### [通用] 时间比较使用时间戳而非 Date 对象

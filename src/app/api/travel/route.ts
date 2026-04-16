@@ -4,6 +4,10 @@ import { selectLocation, selectNextLocation, randomTravelDuration, LOCATION_DB }
 import { MS_PER_DAY, LOCATION_COOLDOWN_MS, randomRestDays } from '@/lib/travel/timeConfig'
 import { aggregateIntents } from '@/lib/travel/intents'
 import { calculateStayDuration, calculateFreshness } from '@/lib/travel/freshness'
+import { callAI } from '@/lib/ai/client'
+import { journalPrompt } from '@/lib/ai/prompts'
+import { findLocationContent } from '@/lib/travel/locationContent'
+import type { SupabaseClient } from '@supabase/supabase-js'
 
 /**
  * GET /api/travel - 查询当前旅行状态（含段落跳转 + 懒完成）
@@ -237,7 +241,28 @@ export async function GET() {
     // 剩余预算不足 0.5 天 → 让下次 poll 触发整体完成
   }
 
-  // === 正常状态：返回当前信息 ===
+  // === 自动生成今日手记（如果还没有） ===
+  const dayNumber = Math.min(
+    Math.floor((nowMs - new Date(travel.started_at).getTime()) / MS_PER_DAY) + 1,
+    travel.duration_days
+  )
+
+  const { data: todayJournal } = await supabase
+    .from('journals')
+    .select('id')
+    .eq('travel_id', travel.id)
+    .eq('day_number', dayNumber)
+    .single()
+
+  if (!todayJournal) {
+    try {
+      await generateJournalForDay(supabase, user.id, travel, currentSegment, dayNumber)
+    } catch (err) {
+      console.error('[Auto-journal] generation failed:', err)
+    }
+  }
+
+  // === 返回当前信息 ===
   const { data: journals } = await supabase
     .from('journals')
     .select('*')
@@ -261,9 +286,11 @@ export async function POST(req: NextRequest) {
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
   let requestedLocationName: string | undefined
+  let chatKeywords: string[] = []
   try {
     const body = await req.json()
     requestedLocationName = body.location_name
+    chatKeywords = body.chat_keywords ?? []
   } catch {
     // body 为空或解析失败
   }
@@ -322,7 +349,9 @@ export async function POST(req: NextRequest) {
   const manualLocation = requestedLocationName
     ? LOCATION_DB.find((loc) => loc.name === requestedLocationName)
     : undefined
-  const location = manualLocation ?? selectLocation(intents, excludeNames)
+  // 合并对话关键词到意向词前面（优先级更高）
+  const combinedIntents = [...chatKeywords, ...intents.filter((i) => !chatKeywords.includes(i))]
+  const location = manualLocation ?? selectLocation(combinedIntents, excludeNames)
   const totalDurationDays = randomTravelDuration()
 
   // 7. 计算第一段的停留天数
@@ -417,4 +446,163 @@ export async function POST(req: NextRequest) {
     first_stay_days: firstStayDays,
     departure_message: `${capybara.name}想去${location.name}看看……明天就出发`,
   })
+}
+
+/**
+ * 内联生成某日手记（被 GET 轮询自动调用）
+ */
+async function generateJournalForDay(
+  supabase: SupabaseClient,
+  userId: string,
+  travel: Record<string, unknown>,
+  currentSegment: Record<string, unknown> | null,
+  dayNumber: number
+) {
+  // 获取卡皮信息
+  const { data: capybara } = await supabase
+    .from('capybaras')
+    .select('name, traits')
+    .eq('owner_id', userId)
+    .single()
+  if (!capybara) return
+
+  // 地点信息
+  const segLoc = currentSegment?.travel_locations as { name: string; region: string; description: string } | null
+  const trvLoc = travel.travel_locations as { name: string; region: string; description: string } | null
+  const location = segLoc ?? trvLoc
+
+  const locName = location?.name ?? '未知地点'
+  const locRegion = location?.region ?? ''
+
+  // 匹配信息
+  const hasEncounter = !!travel.matched_user_id
+  let encounterTopics: string[] = []
+  let encounterScore = 0
+  if (hasEncounter && travel.matched_user_id) {
+    const { data: mm } = await supabase
+      .from('memories').select('topic')
+      .eq('user_id', travel.matched_user_id as string)
+      .eq('shareable', true).limit(5)
+    encounterTopics = (mm ?? []).map((m: { topic: string }) => m.topic)
+    encounterScore = Math.min(encounterTopics.length * 0.2, 1)
+  }
+
+  // 段落过渡
+  const segmentOrder = (travel.current_segment_order as number) ?? 1
+  let isFirstDayOfSegment = false
+  let isLastDayOfSegment = false
+  if (currentSegment) {
+    if (segmentOrder > 1) {
+      const segStartMs = new Date(currentSegment.started_at as string).getTime()
+      const thisDayStartMs = new Date(travel.started_at as string).getTime() + (dayNumber - 1) * MS_PER_DAY
+      isFirstDayOfSegment = thisDayStartMs >= segStartMs && thisDayStartMs < segStartMs + MS_PER_DAY
+    }
+    if (currentSegment.ended_at) {
+      const segEndMs = new Date(currentSegment.ended_at as string).getTime()
+      const nextDayMs = new Date(travel.started_at as string).getTime() + dayNumber * MS_PER_DAY
+      isLastDayOfSegment = nextDayMs >= segEndMs
+    }
+  }
+
+  const intents = (travel.intent_keywords as string[]) ?? []
+  const segDayNum = currentSegment
+    ? Math.max(1, Math.floor((Date.now() - new Date(currentSegment.started_at as string).getTime()) / MS_PER_DAY) + 1)
+    : dayNumber
+  const segTotalDays = (currentSegment?.duration_days as number) ?? (travel.duration_days as number)
+
+  const prompt = journalPrompt({
+    capybaraName: capybara.name,
+    locationName: locName,
+    locationDescription: location?.description ?? '',
+    dayNumber: segDayNum,
+    totalDays: Math.ceil(segTotalDays),
+    traits: (capybara.traits as string[]) ?? [],
+    hasEncounter: hasEncounter && dayNumber >= 2,
+    encounterTopics,
+    encounterScore,
+    intents,
+    isFirstDayOfSegment,
+    isLastDayOfSegment,
+  })
+
+  const aiResult = await callAI('你是旅行手记生成器，只输出 JSON。', prompt)
+
+  let narrative = `${capybara.name}在${locName}度过了安静的一天。看了看天，打了个哈欠。`
+  let encounterNarrative: string | null = null
+  let dailyItem = null
+  let visualHighlights = null
+
+  if (aiResult) {
+    try {
+      const jsonMatch = aiResult.match(/\{[\s\S]*\}/)
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0])
+        narrative = parsed.narrative ?? narrative
+        encounterNarrative = parsed.encounter_narrative ?? null
+        dailyItem = parsed.daily_item ?? null
+        if (Array.isArray(parsed.visual_highlights)) {
+          visualHighlights = parsed.visual_highlights.slice(0, 2)
+        }
+      }
+    } catch { /* fallback */ }
+  }
+
+  // 查找探索图片和文学引用
+  let contentImageUrl: string | null = null
+  let contentQuote: string | null = null
+  let contentQuoteSource: string | null = null
+
+  const { data: dbContent } = await supabase
+    .from('location_content')
+    .select('image_url, quote, quote_source')
+    .or(`location_name.eq.${locName},region_keyword.ilike.%${locRegion.split('·')[0]}%`)
+    .limit(5)
+
+  if (dbContent && dbContent.length > 0) {
+    const pick = dbContent[Math.floor(Math.random() * dbContent.length)]
+    contentImageUrl = pick.image_url
+    contentQuote = pick.quote
+    contentQuoteSource = pick.quote_source
+  } else {
+    const localContent = findLocationContent(locName, locRegion)
+    contentImageUrl = localContent.image_url
+    contentQuote = localContent.quote
+    contentQuoteSource = localContent.quote_source
+  }
+
+  // 保存
+  const row: Record<string, unknown> = {
+    travel_id: travel.id,
+    user_id: userId,
+    day_number: dayNumber,
+    location_name: locName,
+    narrative,
+    encounter_narrative: encounterNarrative,
+    encounter_user_id: hasEncounter ? travel.matched_user_id : null,
+    encounter_score: encounterScore > 0 ? encounterScore : null,
+    daily_item: dailyItem,
+    segment_id: currentSegment?.id ?? null,
+    image_url: contentImageUrl,
+    literary_quote: contentQuote,
+    quote_source: contentQuoteSource,
+  }
+
+  if (visualHighlights) {
+    row.visual_highlights = visualHighlights
+  }
+
+  const { error } = await supabase.from('journals').insert(row)
+  if (error && error.code !== '23505') {
+    // 23505 = unique violation (已存在) → 忽略
+    console.error('[Auto-journal] insert error:', error)
+  }
+
+  // 物品追加
+  if (dailyItem) {
+    const currentItems = (travel.items_found as unknown[]) ?? []
+    await supabase
+      .from('travels')
+      .update({ items_found: [...currentItems, dailyItem] })
+      .eq('id', travel.id)
+  }
 }

@@ -41,3 +41,6 @@ yarn-error.log*
 coverage/
 playwright-report/
 test-results/
+
+# Personal daily reports
+daily_report_*.md
