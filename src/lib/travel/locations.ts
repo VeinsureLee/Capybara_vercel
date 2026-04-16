@@ -164,3 +164,102 @@ export function randomTravelDuration(): number {
   if (r < 0.7) return Math.random() < 0.5 ? 2 : 3
   return Math.random() < 0.5 ? 4 : 5
 }
+
+// ============================================
+// 多地点旅行：区域邻近 + 下一站选择
+// ============================================
+
+/**
+ * 区域邻近关系映射 — 用于多地点旅行时优先选同区域/邻近区域的下一站
+ */
+const REGION_ADJACENCY: Record<string, string[]> = {
+  '中国': ['日本', '泰国', '越南', '柬埔寨', '马来西亚', '印尼', '尼泊尔'],
+  '日本': ['中国'],
+  '泰国': ['越南', '柬埔寨', '马来西亚', '中国'],
+  '越南': ['泰国', '柬埔寨', '中国'],
+  '柬埔寨': ['泰国', '越南'],
+  '马来西亚': ['泰国', '印尼'],
+  '印尼': ['马来西亚'],
+  '捷克': ['瑞士', '法国', '意大利', '挪威', '冰岛', '希腊'],
+  '希腊': ['意大利', '土耳其', '捷克'],
+  '瑞士': ['法国', '意大利', '捷克', '挪威'],
+  '法国': ['瑞士', '意大利', '捷克'],
+  '冰岛': ['挪威', '捷克'],
+  '挪威': ['冰岛', '瑞士', '捷克'],
+  '意大利': ['法国', '瑞士', '希腊', '捷克'],
+  '摩洛哥': ['法国', '捷克'],
+  '土耳其': ['希腊'],
+  '新西兰': ['加拿大', '美国'],
+  '尼泊尔': ['中国'],
+  '马达加斯加': ['肯尼亚'],
+  '肯尼亚': ['马达加斯加'],
+  '加拿大': ['美国'],
+  '美国': ['加拿大'],
+}
+
+function getRegionPrefix(region: string): string {
+  return region.split('·')[0]
+}
+
+function isSameRegion(regionA: string, regionB: string): boolean {
+  return getRegionPrefix(regionA) === getRegionPrefix(regionB)
+}
+
+function isAdjacentRegion(regionA: string, regionB: string): boolean {
+  const prefA = getRegionPrefix(regionA)
+  const prefB = getRegionPrefix(regionB)
+  return REGION_ADJACENCY[prefA]?.includes(prefB) ?? false
+}
+
+/**
+ * 为多地点旅行选择下一个地点
+ *
+ * @param currentRegion 当前地点的 region
+ * @param intents 用户意向词（短期+长期加权合并后的 top 8）
+ * @param excludeNames 本次旅行已去过的地点名
+ * @param visitCounts 用户的历史访问次数 map（location_name → count）
+ */
+export function selectNextLocation(
+  currentRegion: string,
+  intents: string[],
+  excludeNames: string[],
+  visitCounts: Record<string, number>
+): LocationEntry {
+  const available = LOCATION_DB.filter((loc) => !excludeNames.includes(loc.name))
+  if (available.length === 0) {
+    return LOCATION_DB[Math.floor(Math.random() * LOCATION_DB.length)]
+  }
+
+  // 收集意向标签
+  const targetTags = new Set<string>()
+  for (const intent of intents) {
+    for (const [key, tags] of Object.entries(INTENT_TAG_MAP)) {
+      if (intent.includes(key)) {
+        tags.forEach((t) => targetTags.add(t))
+      }
+    }
+    targetTags.add(intent)
+  }
+
+  const scored = available.map((loc) => {
+    const tagHits = targetTags.size > 0
+      ? loc.tags.filter((t) => targetTags.has(t)).length / Math.max(targetTags.size, 1)
+      : 0
+
+    let regionBonus = 0
+    if (isSameRegion(loc.region, currentRegion)) {
+      regionBonus = 0.3
+    } else if (isAdjacentRegion(loc.region, currentRegion)) {
+      regionBonus = 0.15
+    }
+
+    const visits = visitCounts[loc.name] ?? 0
+    const noveltyBonus = visits === 0 ? 0.2 : visits === 1 ? 0.1 : 0
+
+    return { loc, score: tagHits + regionBonus + noveltyBonus }
+  })
+
+  scored.sort((a, b) => b.score - a.score)
+  const top = scored.slice(0, Math.min(5, scored.length))
+  return top[Math.floor(Math.random() * top.length)].loc
+}

@@ -9,7 +9,6 @@ import ContinuousProgress from '@/components/travel/ContinuousProgress'
 import type { MapLocation } from '@/components/travel/WorldMap'
 import { MS_PER_DAY, isTesting } from '@/lib/travel/timeConfig'
 
-// 动态导入地图组件（SSR 不兼容 d3-geo）
 const WorldMap = dynamic(() => import('@/components/travel/WorldMap'), {
   ssr: false,
   loading: () => (
@@ -26,7 +25,19 @@ interface TravelData {
   started_at: string
   estimated_return: string
   completed_at?: string
+  current_segment_order?: number
   travel_locations?: { name: string; region: string; description: string } | null
+}
+
+interface SegmentData {
+  id: string
+  segment_order: number
+  started_at: string
+  ended_at?: string | null
+  duration_days: number
+  visit_count: number
+  travel_locations?: { name: string; region: string; description: string } | null
+  location_image?: string | null
 }
 
 interface JournalData {
@@ -48,11 +59,15 @@ interface TravelHistoryItem {
   completed_at: string
   journal_count: number
   item_count: number
+  segment_count: number
 }
 
 export default function TravelPage() {
   const [travel, setTravel] = useState<TravelData | null>(null)
   const [journals, setJournals] = useState<JournalData[]>([])
+  const [segments, setSegments] = useState<SegmentData[]>([])
+  const [currentSegment, setCurrentSegment] = useState<SegmentData | null>(null)
+  const [justMoved, setJustMoved] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [starting, setStarting] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
@@ -60,20 +75,16 @@ export default function TravelPage() {
   const [resting, setResting] = useState(false)
   const [restUntil, setRestUntil] = useState<string | null>(null)
 
-  // 手记生成阻塞
   const [generatingJournal, setGeneratingJournal] = useState(false)
   const [journalError, setJournalError] = useState<string | null>(null)
 
-  // 地图相关
   const [locations, setLocations] = useState<MapLocation[]>([])
   const [selectedLocation, setSelectedLocation] = useState<MapLocation | null>(null)
   const [activeLocationName, setActiveLocationName] = useState<string | null>(null)
 
-  // 历史旅行记录
   const [history, setHistory] = useState<TravelHistoryItem[]>([])
   const [historyTotal, setHistoryTotal] = useState(0)
 
-  // 实时倒计时（仅用于休息期，进度条组件自管理）
   const [now, setNow] = useState(Date.now())
 
   const loadTravel = useCallback(async () => {
@@ -81,6 +92,13 @@ export default function TravelPage() {
     const data = await res.json()
     setTravel(data.travel)
     setJournals(data.journals ?? [])
+    setSegments(data.segments ?? [])
+    setCurrentSegment(data.current_segment ?? null)
+
+    if (data.just_moved) {
+      setJustMoved(data.moved_to)
+      setTimeout(() => setJustMoved(null), 5000)
+    }
 
     if (data.just_completed) {
       setJustCompleted(true)
@@ -118,14 +136,12 @@ export default function TravelPage() {
     loadHistory()
   }, [loadTravel])
 
-  // 休息期倒计时
   useEffect(() => {
     if (!resting) return
     const timer = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(timer)
   }, [resting])
 
-  // 轮询旅行状态
   useEffect(() => {
     if (travel?.status !== 'traveling') return
     const pollMs = isTesting ? 10000 : 30000
@@ -154,6 +170,7 @@ export default function TravelPage() {
         setMessage(data.departure_message)
         setSelectedLocation(null)
         await loadLocations()
+        await loadTravel()
       } else if (data.error) {
         setMessage(data.error)
       }
@@ -164,7 +181,6 @@ export default function TravelPage() {
     }
   }
 
-  // V2.1: 带阻塞的手记生成
   const daysPassed = travel
     ? Math.min(
         Math.floor((Date.now() - new Date(travel.started_at).getTime()) / MS_PER_DAY) + 1,
@@ -173,7 +189,7 @@ export default function TravelPage() {
     : 0
 
   async function generateJournal() {
-    if (generatingJournal) return // 防重复点击
+    if (generatingJournal) return
     setGeneratingJournal(true)
     setJournalError(null)
     try {
@@ -186,7 +202,6 @@ export default function TravelPage() {
 
       if (res.status === 409) {
         if (data.code === 'DAY_CONFLICT') {
-          // 天数不一致，刷新旅行状态
           setJournalError('天数已变更，正在刷新...')
           await loadTravel()
         } else {
@@ -213,7 +228,6 @@ export default function TravelPage() {
     )
   }
 
-  /** 格式化剩余时间 */
   function formatRemaining(ms: number): string {
     if (ms <= 0) return '即将恢复'
     const totalSec = Math.ceil(ms / 1000)
@@ -226,7 +240,6 @@ export default function TravelPage() {
     return remMin > 0 ? `${hr} 小时 ${remMin} 分` : `${hr} 小时`
   }
 
-  /** 格式化日期范围 */
   function formatDateRange(start: string, end: string): string {
     const s = new Date(start)
     const e = new Date(end)
@@ -235,19 +248,17 @@ export default function TravelPage() {
   }
 
   const canTravel = !travel && !resting
-  const locationName = travel?.travel_locations?.name ?? '远方'
+  const locationName = currentSegment?.travel_locations?.name ?? travel?.travel_locations?.name ?? '远方'
   const canGenerateJournal = travel && travel.status === 'traveling' && daysPassed > journals.length
 
   return (
     <div className="flex flex-col h-screen">
-      {/* 顶栏 */}
       <div className="px-4 py-3 bg-white/90 backdrop-blur border-b border-gray-100">
         <h1 className="font-bold text-gray-800">🗺️ 世界地图</h1>
         <p className="text-[11px] text-gray-400 mt-0.5">点击地点查看详情</p>
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-        {/* 世界地图 */}
         <WorldMap
           locations={locations}
           onSelectLocation={setSelectedLocation}
@@ -257,16 +268,51 @@ export default function TravelPage() {
         {/* ===== 当前旅行状态卡片 ===== */}
         {travel && travel.status === 'traveling' && (
           <div className="p-4 bg-gradient-to-br from-river-50 to-meadow-50 rounded-2xl border border-river-100">
+            {/* 跳转提示 */}
+            {justMoved && (
+              <div className="mb-3 p-2 bg-meadow-100 rounded-lg text-center">
+                <p className="text-xs text-meadow-700">🦫 卡皮觉得待够了，跑去了 {justMoved}！</p>
+              </div>
+            )}
+
             <div className="flex items-center gap-2 mb-3">
               <span className="text-2xl">🦫</span>
               <div>
                 <p className="font-semibold text-gray-800 text-sm">{locationName}</p>
-                <p className="text-xs text-gray-500">{travel.travel_locations?.region}</p>
+                <p className="text-xs text-gray-500">
+                  {currentSegment?.travel_locations?.region ?? travel.travel_locations?.region}
+                  {currentSegment && currentSegment.visit_count > 1 && (
+                    <span className="ml-1 text-amber-500">（第{currentSegment.visit_count}次来）</span>
+                  )}
+                </p>
               </div>
             </div>
-            <p className="text-xs text-gray-600 mb-3">{travel.travel_locations?.description}</p>
+            <p className="text-xs text-gray-600 mb-3">
+              {currentSegment?.travel_locations?.description ?? travel.travel_locations?.description}
+            </p>
 
-            {/* V2.1: 连续进度条 */}
+            {/* 旅行路线面包屑 */}
+            {segments.length > 1 && (
+              <div className="flex items-center gap-1 mb-3 overflow-x-auto pb-1">
+                {segments.map((seg, i) => {
+                  const segLoc = seg.travel_locations as { name: string } | null
+                  const isCurrent = seg.segment_order === (travel.current_segment_order ?? 1)
+                  return (
+                    <div key={seg.id} className="flex items-center shrink-0">
+                      {i > 0 && <span className="text-gray-300 mx-0.5 text-[10px]">→</span>}
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full ${
+                        isCurrent
+                          ? 'bg-capybara-500 text-white'
+                          : seg.ended_at ? 'bg-gray-100 text-gray-500' : 'bg-gray-50 text-gray-400'
+                      }`}>
+                        {segLoc?.name?.split('·')[0] ?? '?'}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
             <ContinuousProgress
               startedAt={travel.started_at}
               estimatedReturn={travel.estimated_return}
@@ -279,7 +325,6 @@ export default function TravelPage() {
               </p>
             )}
 
-            {/* V2.1: 带阻塞的手记生成按钮 */}
             {canGenerateJournal && (
               <button
                 onClick={generateJournal}
@@ -302,7 +347,6 @@ export default function TravelPage() {
               <p className="mt-2 text-xs text-amber-600 text-center">{journalError}</p>
             )}
 
-            {/* 已生成手记数量提示 */}
             {journals.length > 0 && (
               <p className="mt-2 text-[11px] text-gray-400 text-center">
                 已生成 {journals.length} 篇手记
@@ -339,7 +383,7 @@ export default function TravelPage() {
           </div>
         )}
 
-        {/* ===== 无旅行 + 不在休息 = 可以出发 ===== */}
+        {/* ===== 可以出发 ===== */}
         {canTravel && (
           <div className="text-center py-4">
             <p className="text-gray-400 text-sm mb-3">在地图上选一个地点，或让卡皮自己决定~</p>
@@ -394,7 +438,7 @@ export default function TravelPage() {
                     </div>
                     <div className="text-right shrink-0 ml-2">
                       <p className="text-[11px] text-gray-500">
-                        {item.duration_days}天 · {item.journal_count}篇手记
+                        {item.duration_days}天{item.segment_count > 1 ? ` · ${item.segment_count}站` : ''} · {item.journal_count}篇手记
                       </p>
                       {item.item_count > 0 && (
                         <p className="text-[10px] text-capybara-500">
@@ -418,7 +462,6 @@ export default function TravelPage() {
         )}
       </div>
 
-      {/* 地点详情面板 */}
       <LocationDetail
         location={selectedLocation}
         onClose={() => setSelectedLocation(null)}

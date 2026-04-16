@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createServerSupabase } from '@/lib/supabase/server'
-import { selectLocation, randomTravelDuration, LOCATION_DB } from '@/lib/travel/locations'
+import { selectLocation, selectNextLocation, randomTravelDuration, LOCATION_DB } from '@/lib/travel/locations'
 import { MS_PER_DAY, LOCATION_COOLDOWN_MS, randomRestDays } from '@/lib/travel/timeConfig'
+import { aggregateIntents } from '@/lib/travel/intents'
+import { calculateStayDuration, calculateFreshness } from '@/lib/travel/freshness'
 
 /**
- * GET /api/travel - 查询当前旅行状态（含懒完成）
+ * GET /api/travel - 查询当前旅行状态（含段落跳转 + 懒完成）
  */
 export async function GET() {
   const supabase = await createServerSupabase()
@@ -19,18 +21,13 @@ export async function GET() {
     .single()
 
   if (capyErr) {
-    console.error('[travel] capybara query error:', capyErr.message, capyErr.code)
-    // 如果是因为 rest_until 列不存在，降级查询只取 status
     if (capyErr.message?.includes('rest_until')) {
       const { data: fallback } = await supabase
         .from('capybaras')
         .select('status')
         .eq('owner_id', user.id)
         .single()
-      console.log('[travel] fallback capybara status:', fallback?.status)
-      // 没有 rest_until 列，无法管理休息期，直接按 status 处理
       if (fallback && fallback.status !== 'home' && fallback.status !== 'traveling') {
-        // 状态异常，重置
         await supabase.from('capybaras').update({ status: 'home' }).eq('owner_id', user.id)
         return NextResponse.json({ travel: null, capybara_status: 'home' })
       }
@@ -42,16 +39,13 @@ export async function GET() {
     capybaraCheck.rest_until &&
     new Date(capybaraCheck.rest_until) <= new Date()
   ) {
-    // 休息结束 → 回家
     await supabase
       .from('capybaras')
       .update({ status: 'home', rest_until: null })
       .eq('owner_id', user.id)
-
     return NextResponse.json({ travel: null, just_rested: true, capybara_status: 'home' })
   }
 
-  // 仍在休息中（未到期）
   if (capybaraCheck?.status === 'resting') {
     return NextResponse.json({
       travel: null,
@@ -60,9 +54,7 @@ export async function GET() {
     })
   }
 
-  console.log('[travel] capybara status:', capybaraCheck?.status, 'rest_until:', capybaraCheck?.rest_until)
-
-  // 卡皮状态是 traveling 但可能 travels 表记录已丢失 → 修复为 home
+  // 查询当前旅行
   const { data: travel, error: travelErr } = await supabase
     .from('travels')
     .select('*, travel_locations(name, region, description)')
@@ -72,12 +64,8 @@ export async function GET() {
     .limit(1)
     .single()
 
-  console.log('[travel] query result:', travel ? `id=${travel.id} est_return=${travel.estimated_return}` : 'null', 'err:', travelErr?.code)
-
   if (!travel) {
-    // 卡皮状态是 traveling 但没有旅行记录 → 数据不一致，修复
     if (capybaraCheck?.status === 'traveling') {
-      console.log('[travel] FIX: capybara stuck in traveling without travel record, resetting to home')
       await supabase
         .from('capybaras')
         .update({ status: 'home', rest_until: null })
@@ -87,17 +75,33 @@ export async function GET() {
     return NextResponse.json({ travel: null, capybara_status: capybaraCheck?.status ?? 'home' })
   }
 
-  // 懒完成：到时间了标记完成 + 卡皮进入休息期
+  // 查询当前 segment
+  const { data: currentSegment } = await supabase
+    .from('travel_segments')
+    .select('*, travel_locations(name, region, description)')
+    .eq('travel_id', travel.id)
+    .eq('segment_order', travel.current_segment_order ?? 1)
+    .single()
+
+  // 查询所有 segments
+  const { data: allSegments } = await supabase
+    .from('travel_segments')
+    .select('*, travel_locations(name, region, description)')
+    .eq('travel_id', travel.id)
+    .order('segment_order', { ascending: true })
+
+  const nowMs = Date.now()
+
+  // === 整个旅行结束检查 ===
   const returnTime = new Date(travel.estimated_return).getTime()
-  const nowTime = Date.now()
-  console.log('[travel] lazy check:', {
-    estimated_return: travel.estimated_return,
-    returnTime,
-    nowTime,
-    diff_sec: Math.round((returnTime - nowTime) / 1000),
-    shouldComplete: nowTime >= returnTime,
-  })
-  if (returnTime <= nowTime) {
+  if (nowMs >= returnTime) {
+    if (currentSegment && !currentSegment.ended_at) {
+      await supabase
+        .from('travel_segments')
+        .update({ ended_at: new Date().toISOString() })
+        .eq('id', currentSegment.id)
+    }
+
     const restDays = randomRestDays()
     const restUntil = new Date(Date.now() + restDays * MS_PER_DAY).toISOString()
 
@@ -117,36 +121,151 @@ export async function GET() {
 
     return NextResponse.json({
       travel: { ...travel, status: 'completed', completed_at: new Date().toISOString() },
+      segments: allSegments ?? [],
       just_completed: true,
       rest_until: restUntil,
     })
   }
 
-  // 查今日手记
+  // === 当前 segment 到期 → 跳转下一地点 ===
+  if (currentSegment?.ended_at && nowMs >= new Date(currentSegment.ended_at).getTime()) {
+    const elapsedMs = nowMs - new Date(travel.started_at).getTime()
+    const elapsedDays = elapsedMs / MS_PER_DAY
+    const remainingDays = travel.duration_days - elapsedDays
+
+    if (remainingDays >= 0.5) {
+      const intents = await aggregateIntents(supabase, user.id)
+
+      // 本次旅行已去过的地点名
+      const visitedNames = (allSegments ?? []).map((s: Record<string, unknown>) => {
+        const loc = s.travel_locations as { name: string } | null
+        return loc?.name
+      }).filter(Boolean) as string[]
+
+      // 用户历史访问次数
+      const { data: visitRecords } = await supabase
+        .from('location_visits')
+        .select('visit_count, travel_locations!location_visits_location_id_fkey(name)')
+        .eq('user_id', user.id)
+
+      const visitCounts: Record<string, number> = {}
+      ;(visitRecords ?? []).forEach((r: Record<string, unknown>) => {
+        const loc = r.travel_locations as { name: string } | null
+        if (loc) visitCounts[loc.name] = r.visit_count as number
+      })
+
+      const currentLocRegion = (currentSegment.travel_locations as { region: string } | null)?.region ?? ''
+      const nextLoc = selectNextLocation(currentLocRegion, intents, visitedNames, visitCounts)
+
+      // 确保地点存在于 DB
+      let { data: nextLocRow } = await supabase
+        .from('travel_locations')
+        .select('id')
+        .eq('name', nextLoc.name)
+        .single()
+
+      if (!nextLocRow) {
+        const { data: newLoc } = await supabase
+          .from('travel_locations')
+          .insert({
+            name: nextLoc.name,
+            region: nextLoc.region,
+            tags: nextLoc.tags,
+            description: nextLoc.description,
+            visual_keywords: nextLoc.visual_keywords,
+          })
+          .select('id')
+          .single()
+        nextLocRow = newLoc
+      }
+
+      const nextVisitCount = (visitCounts[nextLoc.name] ?? 0) + 1
+      const nextStayDays = Math.min(calculateStayDuration(nextVisitCount), remainingDays)
+      const nextSegmentOrder = (travel.current_segment_order ?? 1) + 1
+
+      const segmentStart = new Date().toISOString()
+      const segmentEnd = new Date(Date.now() + nextStayDays * MS_PER_DAY).toISOString()
+
+      await supabase.from('travel_segments').insert({
+        travel_id: travel.id,
+        location_id: nextLocRow?.id,
+        segment_order: nextSegmentOrder,
+        started_at: segmentStart,
+        ended_at: segmentEnd,
+        duration_days: nextStayDays,
+        visit_count: nextVisitCount,
+        freshness_initial: calculateFreshness(nextVisitCount),
+      })
+
+      await supabase
+        .from('travels')
+        .update({ current_segment_order: nextSegmentOrder })
+        .eq('id', travel.id)
+
+      await supabase.from('location_visits').upsert(
+        {
+          user_id: user.id,
+          location_id: nextLocRow?.id,
+          visit_count: nextVisitCount,
+          last_visited_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id,location_id' }
+      )
+
+      // 重新查询最新状态
+      const { data: updatedSegments } = await supabase
+        .from('travel_segments')
+        .select('*, travel_locations(name, region, description)')
+        .eq('travel_id', travel.id)
+        .order('segment_order', { ascending: true })
+
+      const { data: journals } = await supabase
+        .from('journals')
+        .select('*')
+        .eq('travel_id', travel.id)
+        .order('day_number', { ascending: true })
+
+      return NextResponse.json({
+        travel: { ...travel, current_segment_order: nextSegmentOrder },
+        segments: updatedSegments ?? [],
+        current_segment: updatedSegments?.find((s: Record<string, unknown>) => s.segment_order === nextSegmentOrder),
+        journals: journals ?? [],
+        just_moved: true,
+        moved_to: nextLoc.name,
+      })
+    }
+    // 剩余预算不足 0.5 天 → 让下次 poll 触发整体完成
+  }
+
+  // === 正常状态：返回当前信息 ===
   const { data: journals } = await supabase
     .from('journals')
     .select('*')
     .eq('travel_id', travel.id)
     .order('day_number', { ascending: true })
 
-  return NextResponse.json({ travel, journals: journals ?? [] })
+  return NextResponse.json({
+    travel,
+    segments: allSegments ?? [],
+    current_segment: currentSegment,
+    journals: journals ?? [],
+  })
 }
 
 /**
- * POST /api/travel - 发起新旅行
+ * POST /api/travel - 发起新旅行（多地点版本）
  */
 export async function POST(req: NextRequest) {
   const supabase = await createServerSupabase()
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  // 解析请求体，获取用户手动选择的地点（可选）
   let requestedLocationName: string | undefined
   try {
     const body = await req.json()
     requestedLocationName = body.location_name
   } catch {
-    // body 为空或解析失败，忽略
+    // body 为空或解析失败
   }
 
   // 1. 确认卡皮在家
@@ -161,28 +280,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: '卡皮巴拉还在外面呢~' }, { status: 400 })
   }
 
-  // 2. 聚合最近意向词（从 conversations）
-  const { data: recentConvos } = await supabase
-    .from('conversations')
-    .select('keywords')
-    .eq('user_id', user.id)
-    .not('keywords', 'is', null)
-    .order('created_at', { ascending: false })
-    .limit(20)
-
-  const keywordWeights: Record<string, number> = {}
-  ;(recentConvos || []).forEach((conv, i) => {
-    const weight = 1 - i * 0.04
-    const kws = conv.keywords as string[]
-    kws?.forEach((kw) => {
-      keywordWeights[kw] = (keywordWeights[kw] || 0) + weight
-    })
-  })
-
-  const intents = Object.entries(keywordWeights)
-    .sort(([, a], [, b]) => b - a)
-    .slice(0, 5)
-    .map(([kw]) => kw)
+  // 2. 聚合意向词（短期+长期）
+  const intents = await aggregateIntents(supabase, user.id)
 
   // 3. 冷却期内去过的地点
   const cutoff = new Date(Date.now() - LOCATION_COOLDOWN_MS).toISOString()
@@ -192,7 +291,7 @@ export async function POST(req: NextRequest) {
     .eq('user_id', user.id)
     .gte('started_at', cutoff)
 
-  // 4. ~10% 概率卡皮拒绝出发（独立性表现）
+  // 4. ~10% 概率卡皮拒绝出发
   if (Math.random() < 0.1) {
     const refusals = [
       '不想去……今天想泡水',
@@ -206,19 +305,34 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // 5. 选地点 + 天数（优先使用用户手动选择的地点）
+  // 5. 查询历史访问次数
+  const { data: visitRecords } = await supabase
+    .from('location_visits')
+    .select('visit_count, travel_locations!location_visits_location_id_fkey(name)')
+    .eq('user_id', user.id)
+
+  const visitCounts: Record<string, number> = {}
+  ;(visitRecords ?? []).forEach((r: Record<string, unknown>) => {
+    const loc = r.travel_locations as { name: string } | null
+    if (loc) visitCounts[loc.name] = r.visit_count as number
+  })
+
+  // 6. 选出发地点 + 总行程天数
   const excludeNames = (recentTravels ?? []).map((t) => t.story).filter(Boolean) as string[]
   const manualLocation = requestedLocationName
     ? LOCATION_DB.find((loc) => loc.name === requestedLocationName)
     : undefined
   const location = manualLocation ?? selectLocation(intents, excludeNames)
-  const durationDays = randomTravelDuration()
+  const totalDurationDays = randomTravelDuration()
 
-  // 旅行时间（测试模式：1天=5分钟，生产模式：1天=24小时）
-  const durationMs = durationDays * MS_PER_DAY
-  const estimatedReturn = new Date(Date.now() + durationMs).toISOString()
+  // 7. 计算第一段的停留天数
+  const firstVisitCount = (visitCounts[location.name] ?? 0) + 1
+  const firstStayDays = Math.min(calculateStayDuration(firstVisitCount), totalDurationDays)
 
-  // 6. 插入地点（如果不存在）
+  const totalDurationMs = totalDurationDays * MS_PER_DAY
+  const estimatedReturn = new Date(Date.now() + totalDurationMs).toISOString()
+
+  // 8. 确保地点存在于 travel_locations 表
   let { data: locRow } = await supabase
     .from('travel_locations')
     .select('id')
@@ -238,12 +352,12 @@ export async function POST(req: NextRequest) {
       .select('id')
       .single()
     if (locErr) {
-      console.error('Insert travel_location error (RLS?):', locErr.message)
+      console.error('Insert travel_location error:', locErr.message)
     }
     locRow = newLoc
   }
 
-  // 7. 创建旅行记录
+  // 9. 创建旅行记录
   const { data: travel, error } = await supabase
     .from('travels')
     .insert({
@@ -251,10 +365,11 @@ export async function POST(req: NextRequest) {
       user_id: user.id,
       status: 'traveling',
       location_id: locRow?.id,
-      duration_days: durationDays,
+      duration_days: totalDurationDays,
       intent_keywords: intents,
       started_at: new Date().toISOString(),
       estimated_return: estimatedReturn,
+      current_segment_order: 1,
     })
     .select()
     .single()
@@ -264,7 +379,31 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  // 8. 更新卡皮状态
+  // 10. 创建第一个 segment
+  const firstSegmentEnd = new Date(Date.now() + firstStayDays * MS_PER_DAY).toISOString()
+  await supabase.from('travel_segments').insert({
+    travel_id: travel.id,
+    location_id: locRow?.id,
+    segment_order: 1,
+    started_at: new Date().toISOString(),
+    ended_at: firstSegmentEnd,
+    duration_days: firstStayDays,
+    visit_count: firstVisitCount,
+    freshness_initial: calculateFreshness(firstVisitCount),
+  })
+
+  // 11. 更新 location_visits（upsert）
+  await supabase.from('location_visits').upsert(
+    {
+      user_id: user.id,
+      location_id: locRow?.id,
+      visit_count: firstVisitCount,
+      last_visited_at: new Date().toISOString(),
+    },
+    { onConflict: 'user_id,location_id' }
+  )
+
+  // 12. 更新卡皮状态
   await supabase
     .from('capybaras')
     .update({ status: 'traveling' })
@@ -273,8 +412,9 @@ export async function POST(req: NextRequest) {
   return NextResponse.json({
     travel,
     location,
-    duration_days: durationDays,
+    duration_days: totalDurationDays,
     estimated_return: estimatedReturn,
+    first_stay_days: firstStayDays,
     departure_message: `${capybara.name}想去${location.name}看看……明天就出发`,
   })
 }

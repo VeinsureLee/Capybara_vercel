@@ -37,6 +37,17 @@ interface JournalDetail {
   created_at: string
 }
 
+interface SegmentDetail {
+  id: string
+  segment_order: number
+  duration_days: number
+  visit_count: number
+  started_at: string
+  ended_at?: string | null
+  travel_locations?: { name: string; region: string; description: string } | null
+  location_image?: string | null
+}
+
 interface ItemData {
   name: string
   description: string
@@ -64,6 +75,7 @@ export default function TravelDetailPage() {
 
   const [travel, setTravel] = useState<TravelDetail | null>(null)
   const [journals, setJournals] = useState<JournalDetail[]>([])
+  const [segments, setSegments] = useState<SegmentDetail[]>([])
   const [locationImage, setLocationImage] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [imageDetailOpen, setImageDetailOpen] = useState(false)
@@ -77,6 +89,7 @@ export default function TravelDetailPage() {
     const data = await res.json()
     setTravel(data.travel ?? null)
     setJournals(data.journals ?? [])
+    setSegments(data.segments ?? [])
     setLocationImage(data.location_image ?? null)
     setLoading(false)
   }, [travelId])
@@ -186,6 +199,27 @@ export default function TravelDetailPage() {
               </div>
             )}
           </div>
+
+          {/* 旅行路线概览 */}
+          {segments.length > 1 && (
+            <div className="p-3 bg-gradient-to-r from-river-50 to-meadow-50 rounded-xl">
+              <p className="text-xs font-medium text-gray-600 mb-2">旅行路线</p>
+              <div className="flex items-center gap-1 flex-wrap">
+                {segments.map((seg, i) => {
+                  const segLoc = seg.travel_locations as { name: string } | null
+                  return (
+                    <div key={seg.id} className="flex items-center">
+                      {i > 0 && <span className="text-gray-300 mx-1">→</span>}
+                      <span className="text-[11px] px-2 py-0.5 bg-white rounded-full text-gray-700 shadow-sm">
+                        {segLoc?.name?.split('·').pop() ?? '?'}
+                        {seg.visit_count > 1 && <span className="text-amber-500 ml-0.5">×{seg.visit_count}</span>}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
 
           {/* 旅途手记 */}
           {journals.length > 0 && (

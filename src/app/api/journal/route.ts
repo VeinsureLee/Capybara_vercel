@@ -15,7 +15,6 @@ export async function GET(req: NextRequest) {
   const travelId = req.nextUrl.searchParams.get('travel_id')
 
   if (travelId) {
-    // 指定旅行的手记
     const { data: journals } = await supabase
       .from('journals')
       .select('*')
@@ -26,7 +25,6 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ journals: journals ?? [] })
   }
 
-  // 最近的手记（用于首页展示）
   const { data: journals } = await supabase
     .from('journals')
     .select('*')
@@ -38,15 +36,13 @@ export async function GET(req: NextRequest) {
 }
 
 /**
- * POST /api/journal - 为当前旅行生成今日手记
- * V2.1: 增加 expected_day 校验 + visual_highlights 生成
+ * POST /api/journal - 为当前旅行生成今日手记（多地点感知）
  */
 export async function POST(req: NextRequest) {
   const supabase = await createServerSupabase()
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  // 解析请求体（支持 expected_day 参数）
   let expectedDay: number | undefined
   try {
     const body = await req.json()
@@ -67,7 +63,21 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: '当前没有进行中的旅行' }, { status: 400 })
   }
 
-  // 2. 计算今天是第几天
+  // 2. 获取当前 segment（如果有）
+  const segmentOrder = travel.current_segment_order ?? 1
+  const { data: currentSegment } = await supabase
+    .from('travel_segments')
+    .select('*, travel_locations(name, region, description, tags)')
+    .eq('travel_id', travel.id)
+    .eq('segment_order', segmentOrder)
+    .single()
+
+  // 使用 segment 的地点信息（如果存在），否则 fallback 到 travel 的地点
+  const segmentLocation = currentSegment?.travel_locations as { name: string; region: string; description: string } | null
+  const travelLocation = travel.travel_locations as { name: string; region: string; description: string } | null
+  const location = segmentLocation ?? travelLocation
+
+  // 3. 计算今天是第几天（相对于整个旅行）
   const startDate = new Date(travel.started_at)
   const now = new Date()
   const dayNumber = Math.min(
@@ -75,7 +85,6 @@ export async function POST(req: NextRequest) {
     travel.duration_days
   )
 
-  // V2.1: 校验前端传入的 expected_day 是否与后端一致
   if (expectedDay !== undefined && expectedDay !== dayNumber) {
     return NextResponse.json(
       { error: '天数不一致，请刷新页面', code: 'DAY_CONFLICT', server_day: dayNumber },
@@ -95,7 +104,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: '今日手记已生成', journal_id: existing.id }, { status: 409 })
   }
 
-  // 3. 获取卡皮信息
+  // 4. 获取卡皮信息
   const { data: capybara } = await supabase
     .from('capybaras')
     .select('name, traits')
@@ -104,7 +113,7 @@ export async function POST(req: NextRequest) {
 
   if (!capybara) return NextResponse.json({ error: 'No capybara' }, { status: 404 })
 
-  // 4. 获取匹配信息（如果有）
+  // 5. 匹配信息
   const hasEncounter = !!travel.matched_user_id
   let encounterTopics: string[] = []
   let encounterScore = 0
@@ -116,27 +125,47 @@ export async function POST(req: NextRequest) {
       .eq('user_id', travel.matched_user_id)
       .eq('shareable', true)
       .limit(5)
-
     encounterTopics = (matchedMemories ?? []).map((m) => m.topic)
-    // 简化：用共振主题数量估算分数
     encounterScore = Math.min(encounterTopics.length * 0.2, 1)
   }
 
-  // 5. 生成手记
-  const location = travel.travel_locations as { name: string; region: string; description: string } | null
+  // 6. 判断段落过渡状态
+  let isLastDayOfSegment = false
+  if (currentSegment?.ended_at) {
+    const segEndMs = new Date(currentSegment.ended_at).getTime()
+    const nextDayMs = new Date(travel.started_at).getTime() + dayNumber * MS_PER_DAY
+    isLastDayOfSegment = nextDayMs >= segEndMs
+  }
+
+  let isFirstDayOfSegment = false
+  if (currentSegment && segmentOrder > 1) {
+    const segStartMs = new Date(currentSegment.started_at).getTime()
+    const thisDayStartMs = new Date(travel.started_at).getTime() + (dayNumber - 1) * MS_PER_DAY
+    isFirstDayOfSegment = thisDayStartMs >= segStartMs &&
+      thisDayStartMs < segStartMs + MS_PER_DAY
+  }
+
+  // 7. 生成手记
   const intents = (travel.intent_keywords as string[]) ?? []
+
+  const segmentDayNumber = currentSegment
+    ? Math.max(1, Math.floor((now.getTime() - new Date(currentSegment.started_at).getTime()) / MS_PER_DAY) + 1)
+    : dayNumber
+  const segmentTotalDays = currentSegment?.duration_days ?? travel.duration_days
 
   const prompt = journalPrompt({
     capybaraName: capybara.name,
     locationName: location?.name ?? '未知地点',
     locationDescription: location?.description ?? '',
-    dayNumber,
-    totalDays: travel.duration_days,
+    dayNumber: segmentDayNumber,
+    totalDays: Math.ceil(segmentTotalDays),
     traits: (capybara.traits as string[]) ?? [],
-    hasEncounter: hasEncounter && dayNumber >= 2, // 第1天不触发相遇
+    hasEncounter: hasEncounter && dayNumber >= 2,
     encounterTopics,
     encounterScore,
     intents,
+    isFirstDayOfSegment,
+    isLastDayOfSegment,
   })
 
   const aiResult = await callAI('你是旅行手记生成器，只输出 JSON。', prompt)
@@ -154,15 +183,14 @@ export async function POST(req: NextRequest) {
         narrative = parsed.narrative ?? narrative
         encounterNarrative = parsed.encounter_narrative ?? null
         dailyItem = parsed.daily_item ?? null
-        // V2.1: 解析 visual_highlights
         if (Array.isArray(parsed.visual_highlights)) {
-          visualHighlights = parsed.visual_highlights.slice(0, 2) // 最多保留2个
+          visualHighlights = parsed.visual_highlights.slice(0, 2)
         }
       }
     } catch { /* fallback */ }
   }
 
-  // 6. 保存手记（UNIQUE(travel_id, day_number) 约束提供数据库级防重）
+  // 8. 保存手记
   const baseRow = {
     travel_id: travel.id,
     user_id: user.id,
@@ -173,14 +201,14 @@ export async function POST(req: NextRequest) {
     encounter_user_id: hasEncounter ? travel.matched_user_id : null,
     encounter_score: encounterScore > 0 ? encounterScore : null,
     daily_item: dailyItem,
+    segment_id: currentSegment?.id ?? null,
   }
 
-  // 尝试包含 visual_highlights；如果列不存在则降级重试
-  let journal, error
   const rowWithHighlights = visualHighlights
     ? { ...baseRow, visual_highlights: visualHighlights }
     : baseRow
 
+  let journal, error
   const result = await supabase
     .from('journals')
     .insert(rowWithHighlights)
@@ -190,7 +218,6 @@ export async function POST(req: NextRequest) {
   journal = result.data
   error = result.error
 
-  // 如果是 visual_highlights 列不存在（PGRST204），降级不带该字段重试
   if (error?.code === 'PGRST204' && error.message?.includes('visual_highlights')) {
     console.warn('visual_highlights column missing, retrying without it')
     const fallback = await supabase
@@ -203,7 +230,6 @@ export async function POST(req: NextRequest) {
   }
 
   if (error) {
-    // 如果是唯一约束冲突（并发请求），返回 409
     if (error.code === '23505') {
       return NextResponse.json({ error: '今日手记已生成（并发冲突）' }, { status: 409 })
     }
@@ -211,7 +237,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  // 7. 如果有物品，追加到旅行的 items_found
+  // 9. 物品追加
   if (dailyItem) {
     const currentItems = (travel.items_found as unknown[]) ?? []
     await supabase

@@ -198,6 +198,34 @@ export interface Travel {
   /** 预计返回时间 */
   estimated_return: string
   completed_at?: string
+  /** 当前正在进行的分段序号 */
+  current_segment_order?: number
+}
+
+/** 旅行分段 — 一次旅行中的单个地点停留 */
+export interface TravelSegment {
+  id: string
+  travel_id: string
+  location_id: string
+  segment_order: number
+  started_at: string
+  ended_at?: string | null
+  /** 在该地点停留的天数（0.5 / 1.0 / 1.5 / 2.0） */
+  duration_days: number
+  /** 这是第几次来这个地点 */
+  visit_count: number
+  /** 初始新鲜感值 */
+  freshness_initial: number
+  /** join 的地点信息 */
+  travel_locations?: { name: string; region: string; description: string } | null
+}
+
+/** 用户对某地点的历史访问记录 */
+export interface LocationVisitRecord {
+  user_id: string
+  location_id: string
+  visit_count: number
+  last_visited_at: string
 }
 
 /** 每日旅行手记 */

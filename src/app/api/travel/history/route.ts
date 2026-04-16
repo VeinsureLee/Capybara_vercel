@@ -40,6 +40,11 @@ export async function GET(req: NextRequest) {
         .select('id', { count: 'exact', head: true })
         .eq('travel_id', t.id)
 
+      const { count: segmentCount } = await supabase
+        .from('travel_segments')
+        .select('id', { count: 'exact', head: true })
+        .eq('travel_id', t.id)
+
       const itemsFound = (t.items_found as unknown[]) ?? []
       const loc = t.travel_locations as unknown as { name: string; region: string } | null
 
@@ -52,6 +57,7 @@ export async function GET(req: NextRequest) {
         completed_at: t.completed_at,
         journal_count: journalCount ?? 0,
         item_count: itemsFound.length,
+        segment_count: segmentCount ?? 1,
       }
     })
   )

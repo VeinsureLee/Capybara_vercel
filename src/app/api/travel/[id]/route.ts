@@ -3,7 +3,7 @@ import { createServerSupabase } from '@/lib/supabase/server'
 import { LOCATION_DB } from '@/lib/travel/locations'
 
 /**
- * GET /api/travel/[id] - 获取单次旅行详情（含手记、物品）
+ * GET /api/travel/[id] - 获取单次旅行详情（含手记、物品、分段）
  */
 export async function GET(
   _req: NextRequest,
@@ -15,7 +15,6 @@ export async function GET(
 
   const { id } = await params
 
-  // 获取旅行记录（含地点信息）
   const { data: travel, error } = await supabase
     .from('travels')
     .select('*, travel_locations(name, region, description, tags, visual_keywords)')
@@ -27,12 +26,17 @@ export async function GET(
     return NextResponse.json({ error: '旅行记录不存在' }, { status: 404 })
   }
 
-  // 从本地地点库补充 image URL（DB 中不存 image）
+  // 查询 segments
+  const { data: segments } = await supabase
+    .from('travel_segments')
+    .select('*, travel_locations(name, region, description)')
+    .eq('travel_id', id)
+    .order('segment_order', { ascending: true })
+
+  // 从本地地点库补充 image URL
   const locData = travel.travel_locations as { name?: string } | null
   const localLoc = LOCATION_DB.find((l) => l.name === locData?.name)
 
-  // 如果 travel_locations join 为空（location_id 为 null / RLS 问题），
-  // 尝试从手记的 location_name 匹配本地地点库
   if (!travel.travel_locations) {
     const { data: firstJournal } = await supabase
       .from('journals')
@@ -57,13 +61,18 @@ export async function GET(
     }
   }
 
-  // 附加 image URL
   const matchedLoc = localLoc ?? LOCATION_DB.find(
     (l) => l.name === (travel.travel_locations as { name?: string } | null)?.name
   )
   const locationImage = matchedLoc?.image ?? null
 
-  // 获取该旅行的所有手记
+  // 为每个 segment 附加 image URL
+  const segmentsWithImages = (segments ?? []).map((seg: Record<string, unknown>) => {
+    const segLoc = seg.travel_locations as { name?: string } | null
+    const segLocalLoc = LOCATION_DB.find((l) => l.name === segLoc?.name)
+    return { ...seg, location_image: segLocalLoc?.image ?? null }
+  })
+
   const { data: journals } = await supabase
     .from('journals')
     .select('*')
@@ -73,6 +82,7 @@ export async function GET(
 
   return NextResponse.json({
     travel,
+    segments: segmentsWithImages,
     journals: journals ?? [],
     location_image: locationImage,
   })
