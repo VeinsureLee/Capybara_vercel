@@ -1,7 +1,6 @@
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
-import { createClient } from '@/lib/supabase/client'
 import BottomNav from '@/components/BottomNav'
 import type { Capybara, Conversation } from '@/types'
 
@@ -29,7 +28,7 @@ export default function ChatPage() {
   const [travelInfo, setTravelInfo] = useState<string | null>(null)
   const [memoryReaction, setMemoryReaction] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const supabase = createClient()
+  const isInitialLoad = useRef(true)
 
   // 初始化：获取卡皮巴拉
   useEffect(() => {
@@ -51,19 +50,13 @@ export default function ChatPage() {
   }
 
   async function loadMessages() {
-    const {
-      data: { user },
-    } = await supabase.auth.getUser()
-    if (!user) return
-
-    const { data } = await supabase
-      .from('conversations')
-      .select('*')
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: true })
-      .limit(50)
-
-    setMessages(data || [])
+    try {
+      const res = await fetch('/api/chat')
+      const data = await res.json()
+      setMessages(data.messages || [])
+    } catch (err) {
+      console.error('Load messages error:', err)
+    }
   }
 
   async function checkExploration() {
@@ -109,10 +102,17 @@ export default function ChatPage() {
     }
   }
 
-  // 滚到底部
+  // 滚到底部：首次加载用 instant 直接定位，后续新消息用 smooth 平滑滚动
+  // 必须同时监听 view，因为 messages 更新时 view 可能还是 'loading'（DOM 不存在）
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+    if (view !== 'chat' || messages.length === 0) return
+    if (isInitialLoad.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'instant' })
+      isInitialLoad.current = false
+    } else {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [messages, view])
 
   // 定期检查探索状态
   useEffect(() => {

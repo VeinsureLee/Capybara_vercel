@@ -6,6 +6,37 @@ import { extractMemory, memoryReactionText } from '@/lib/memory/extract'
 import { MS_PER_DAY } from '@/lib/travel/timeConfig'
 import type { ChatResponse, ChatResponseV2 } from '@/types'
 
+// GET: 获取历史消息
+export async function GET() {
+  const supabase = await createServerSupabase()
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
+  if (!user) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  const { data: capybara } = await supabase
+    .from('capybaras')
+    .select('id')
+    .eq('owner_id', user.id)
+    .single()
+
+  if (!capybara) {
+    return NextResponse.json({ messages: [] })
+  }
+
+  const { data } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('user_id', user.id)
+    .eq('capybara_id', capybara.id)
+    .order('created_at', { ascending: true })
+
+  return NextResponse.json({ messages: data || [] })
+}
+
 export async function POST(req: NextRequest) {
   const supabase = await createServerSupabase()
   const {
@@ -172,20 +203,23 @@ export async function POST(req: NextRequest) {
   }
 
   // 5. 保存对话（分两次插入，确保 created_at 不同，避免排序错乱）
-  await supabase.from('conversations').insert({
+  const { error: userMsgErr } = await supabase.from('conversations').insert({
     user_id: user.id,
     capybara_id: capybara.id,
     role: 'user',
     content: message,
     keywords: chatResponse.keywords,
   })
-  await supabase.from('conversations').insert({
+  if (userMsgErr) console.error('[Chat] save user message failed:', userMsgErr)
+
+  const { error: capyMsgErr } = await supabase.from('conversations').insert({
     user_id: user.id,
     capybara_id: capybara.id,
     role: 'capybara',
     content: chatResponse.reply,
     mood: chatResponse.mood,
   })
+  if (capyMsgErr) console.error('[Chat] save capybara reply failed:', capyMsgErr)
 
   // 6. 更新卡皮巴拉心情
   await supabase

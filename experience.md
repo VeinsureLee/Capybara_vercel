@@ -11,6 +11,11 @@ Lessons learned from debugging. Read this before writing new code to avoid repea
 - **Principle**: 所有 `useState`、`useEffect`、`useCallback` 必须在组件函数体最顶部，在任何条件 return 之前。React 按调用顺序追踪 hooks。
 - **Files**: `src/app/travel/page.tsx`
 
+### [BUG-013] useEffect 操作 DOM ref 时必须确保条件渲染分支已激活
+- **Context**: 滚动 useEffect 只监听 `messages`，但 `messages` 更新时 `view` 仍为 `'loading'`（条件渲染显示加载动画），聊天 DOM 不存在，`messagesEndRef.current=null`。等 `view` 变为 `'chat'` 后 effect 不再触发。
+- **Principle**: 当 ref 元素在条件渲染分支中时，useEffect 的依赖数组必须包含控制该分支是否渲染的状态变量。否则 effect 会在 DOM 不存在时执行，之后不会补执行。
+- **Files**: `src/app/chat/page.tsx`
+
 ---
 
 ## API Design
